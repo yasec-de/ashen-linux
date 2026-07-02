@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# 
+# Ashen Tamper Alarm Driver
+#
+
+config ASHEN_TAMPER
+	tristate "Ashen Sensor Heartbeat Protocol Support"
+	help
+	  Enables Ashen tamper sensor heartbeat protocol support. The driver
+	  supports a configurable numer of UART heartbeat links, as well as a
+	  configurable number of GPIO tamper inputs.

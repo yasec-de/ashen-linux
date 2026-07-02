@@ -3991,6 +3991,11 @@ S:	Supported
 W:	http://www.akm.com/
 F:	drivers/iio/magnetometer/ak8974.c
 
+ASHEN TAMPER DRIVER
+M: Jan Sebastian Götte <kernel@yasec.de>
+S: Supported
+F: drivers/misc/ashen-tamper
+
 AOSONG AGS02MA TVOC SENSOR DRIVER
 M:	Anshul Dalal <anshulusr@gmail.com>
 L:	linux-iio@vger.kernel.org
