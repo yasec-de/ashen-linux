@@ -7,7 +7,7 @@
 #include <linux/types.h>
 
 
-ssize_t cobs_encode(const uint8_t *input, size_t input_len, uint8_t *output, size_t output_len)
+ssize_t cobs_encode(const u8 *input, size_t input_len, u8 *output, size_t output_len)
 {
 	size_t idx_pos = 0;
 	size_t out_pos = 1;
@@ -17,7 +17,7 @@ ssize_t cobs_encode(const uint8_t *input, size_t input_len, uint8_t *output, siz
 		if (out_pos >= output_len)
 			return -1;
 
-		uint8_t inbyte = input[in_pos];
+		u8 inbyte = input[in_pos];
 		in_pos += 1;
 
 		if (out_pos - idx_pos >= 255) {
@@ -48,13 +48,13 @@ ssize_t cobs_encode(const uint8_t *input, size_t input_len, uint8_t *output, siz
 }
 
 /* input and output may overlap. */
-ssize_t cobs_decode(const uint8_t *input, size_t input_len, uint8_t *output, size_t output_len)
+ssize_t cobs_decode(const u8 *input, size_t input_len, u8 *output, size_t output_len)
 {
 	size_t out_pos = 0;
 	size_t in_pos = 0;
 
 	if (input_len == 0)
-		return -1;
+		return -EINVAL;
 
 	while (in_pos < input_len) {
 		size_t len = input[in_pos];
@@ -62,7 +62,7 @@ ssize_t cobs_decode(const uint8_t *input, size_t input_len, uint8_t *output, siz
 
 		for (size_t i=0; i<len-1; i++) {
 			if (in_pos >= input_len)
-				break;
+				return -EINTR;
 			output[out_pos] = input[in_pos];
 			in_pos += 1;
 			out_pos += 1;

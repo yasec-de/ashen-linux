@@ -4,5 +4,6 @@ obj-$(CONFIG_ASHEN_TAMPER) := ashen-tamper.o
 
 ashen-tamper-y :=	cobs.o		\
 			noise.o		\
-			ashen.o
+			ashen.o		\
+			cobs.o
 
