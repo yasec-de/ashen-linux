@@ -4,7 +4,9 @@
  * Author:       Jan Sebastian Götte <kernel@yasec.de>
  */   
 
+#include <linux/errno.h>
 #include <linux/types.h>
+#include "cobs.h"
 
 
 ssize_t cobs_encode(const u8 *input, size_t input_len, u8 *output, size_t output_len)

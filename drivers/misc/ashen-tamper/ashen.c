@@ -6,6 +6,8 @@
 
 #include <linux/kernel.h>
 #include <linux/hrtimer.h>
+#include <linux/module.h>
+#include <linux/of.h>
 #include <linux/serdev.h>
 #include <linux/sysfs.h>
 #include "cobs.h"
@@ -27,13 +29,13 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 	ssize_t ret;
 	ssize_t to_write;
 
-	ret = noise_handshake(ashen->noise_st, buf, len, ash->tx_buf); 
+	ret = noise_handshake(&ash->noise_st, buf, len, ash->tx_buf);
 	if (ret < 0) {
-		pr_err("ashen-tamper: noise handshake error\n"); 
+		pr_err("ashen-tamper: noise handshake error\n");
 		ash->conn_st = CONN_DISCONNECTED;
 		return;
 	} else if (ret == 0) {
-		complete(ash->connection_ready);
+		complete(&ash->connection_ready);
 		ash->conn_st = CONN_CONNECTED;
 		return;
 	} /* else: ret > 0 */
@@ -54,13 +56,12 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 static void ashen_handle_packet(struct ashen_tamper *ash,
 		const u8 *buf, size_t len)
 {
-	complete(ash->packet_ready);
+	complete(&ash->packet_ready);
 }
 
 static void ashen_receive_packet(struct ashen_tamper *ash,
 		const u8 *buf, size_t len)
 {
-	ssize_t ret;
 	switch (ash->conn_st) {
 	case CONN_DISCONNECTED:
 		pr_warn("ashen-tamper: received out-of-order message from device\n");
@@ -69,7 +70,7 @@ static void ashen_receive_packet(struct ashen_tamper *ash,
 		ashen_continue_handshake(ash, buf, len);
 		break;
 	case CONN_CONNECTED:
-		if (!noise_decrypt_transport_message(ash->noise_st,
+		if (!noise_decrypt_transport_message(&ash->noise_st,
 					ash->rx_buf, ash->rx_len, ash->rx_buf))
 			break;
 
@@ -117,12 +118,15 @@ static size_t ashen_receive(struct serdev_device *serdev,
 		const u8 *buf, size_t size)
 {
 	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
-	size_t consumed;
+	size_t consumed = 0;
+	size_t chunk;
 
-	while (size && consumed = ashen_receive_chunk(ash, buf, size)) {
-		buf += consumed;
-		size -= consumed;
+	while (size && (chunk = ashen_receive_chunk(ash, buf, size))) {
+		buf += chunk;
+		size -= chunk;
+		consumed += chunk;
 	}
+	return consumed;
 }
 
 static const struct serdev_device_ops ashen_serdev_ops = {
@@ -138,12 +142,13 @@ static const struct of_device_id ashen_tamper_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, ashen_tamper_of_match);
 
-static void reset_hb_timeout(struct ashen_tamper *ash)
+/* ponytail: __maybe_unused until the heartbeat rx path calls these */
+static void __maybe_unused reset_hb_timeout(struct ashen_tamper *ash)
 {
-	hrtimer_forward_now(&ash.timer, ash->timeout);
+	hrtimer_forward_now(&ash->hb_timer, ash->timeout);
 }
 
-static void start_hb_timer(struct ashen_tamper *ash, unsigned int ivl_adv_us)
+static void __maybe_unused start_hb_timer(struct ashen_tamper *ash, unsigned int ivl_adv_us)
 {
 	ktime_t ivl_adv = us_to_ktime(ivl_adv_us);
 	ash->timeout = min(ash->timeout_min, ivl_adv + ash->slack_min);
@@ -158,31 +163,31 @@ ash_hb_timer_fn(struct hrtimer *hrtimer)
 }
 
 static ssize_t timeout_show(struct device *dev, struct device_attribute *attr,
-			  const char *buf)
+			  char *buf)
 {
 	struct ashen_tamper *ash = dev_get_drvdata(dev);
-	return sysfs_emit(buf, "%llu\n", ktime_to_us(ash->timeout));
+	return sysfs_emit(buf, "%lld\n", ktime_to_us(ash->timeout));
 }
 
-static DEVICE_ATTR_RW(timeout);
+/* ponytail: RO until the *_store handlers exist, then back to RW */
+static DEVICE_ATTR_RO(timeout);
 
 static ssize_t armed_show(struct device *dev, struct device_attribute *attr,
-			  const char *buf)
+			  char *buf)
 {
 	struct ashen_tamper *ash = dev_get_drvdata(dev);
-	return sysfs_emit(buf, "%llu\n", ash->timeout > 0);
+	return sysfs_emit(buf, "%d\n", ash->timeout > 0);
 }
 
-static DEVICE_ATTR_RW(armed);
+static DEVICE_ATTR_RO(armed);
 
 static ssize_t connected_show(struct device *dev, struct device_attribute *attr,
-			  const char *buf)
+			  char *buf)
 {
-	struct ashen_tamper *ash = dev_get_drvdata(dev);
-	return sysfs_emit(buf, "%llu\n", 0); /* FIXME */
+	return sysfs_emit(buf, "%d\n", 0); /* FIXME */
 }
 
-static DEVICE_ATTR_RW(armed);
+static DEVICE_ATTR_RO(connected);
 
 static struct attribute *ashen_attrs[] = {
 	&dev_attr_timeout.attr,
@@ -197,13 +202,13 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 {
 	int ret;
 	u32 speed = ASHEN_TAMPER_DEFAULT_BAUDRATE;
-	u32 bufsize = 0;
+	u32 val;
 
-	struct ashen_tamper *ash = devm_kzalloc(serdev->dev,
-			sizeof(*ash), GFP_KERNEL | __GFP_NOFAIL);
+	struct ashen_tamper *ash = devm_kzalloc(&serdev->dev,
+			sizeof(*ash), GFP_KERNEL);
 
 	if (!ash) {
-		pr_err("ashen-tamper: Fail to allocate driver structure\n");
+		ret = -ENOMEM;
 		goto error;
 	}
 
@@ -213,27 +218,18 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 
 	of_property_read_u32(serdev->dev.of_node, "current-speed", &speed);
 
-	ash->timeout_min = ASHEN_TAMPER_DEFAULT_TIMEOUT_MIN_US;
-	of_property_read_u32(serdev->dev.of_node, "timeout-min-us",
-			&ash->timeout_min);
-	ash->timeout_min = us_to_ktime(ash->timeout_min);
+	val = ASHEN_TAMPER_DEFAULT_TIMEOUT_MIN_US;
+	of_property_read_u32(serdev->dev.of_node, "timeout-min-us", &val);
+	ash->timeout_min = us_to_ktime(val);
 
-	ash->slack_min = ASHEN_TAMPER_DEFAULT_SLACK_MIN_US;
-	of_property_read_u32(serdev->dev.of_node, "slack-min-us",
-			&ash->slack_min);
-	ash->slack_min = us_to_ktime(ash->slack_min);
+	val = ASHEN_TAMPER_DEFAULT_SLACK_MIN_US;
+	of_property_read_u32(serdev->dev.of_node, "slack-min-us", &val);
+	ash->slack_min = us_to_ktime(val);
 
 	ash->timeout = 0;
 
 	hrtimer_setup(&ash->hb_timer, ash_hb_timer_fn, CLOCK_MONOTONIC,
 			HRTIMER_MODE_REL_HARD);
-
-	ret = sysfs_create_group(&serdev->dev->kobj, &ashen_group);
-	if (ret) {
-		dev_err(&serdev->dev,
-			"Unable to create ashen heartbeat link sysfs attrs\n");
-		goto error;
-	}
 
 	ret = serdev_device_open(serdev);
 	if (ret) {
@@ -247,7 +243,6 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	mutex_init(&ash->tx_lock);
 	return 0;
 error:
-	kfree(ash);
 	if (panic_on_error)
 		panic("ashen-tamper initialization failure");
 	return ret;
@@ -255,8 +250,6 @@ error:
 
 static void ashen_tamper_remove(struct serdev_device *serdev)
 {
-	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
-
 	/* Flush any pending characters in the driver. */
 	serdev_device_close(serdev);
 }
@@ -267,6 +260,7 @@ static struct serdev_device_driver ashen_tamper_driver = {
 	.driver = {
 		.name = "ashen-tamper",
 		.of_match_table = ashen_tamper_of_match,
+		.dev_groups = ashen_groups,
 	},
 };
 

@@ -32,7 +32,7 @@ static void mix_hash(struct noise_handshake_state *st, const u8 *src, size_t src
 void noise_init(struct noise_state *st, bool i_am_the_initiator)
 {
 	memzero_explicit(st, sizeof(*st));
-	st->i_am_the_initiator = i_am_the_initiator;
+	st->hs.i_am_the_initiator = i_am_the_initiator;
 
 	blake2s(NULL, 0, handshake_name, sizeof(handshake_name),
 		st->hs.ss.chaining_key, NOISE_HASH_LEN);
@@ -291,8 +291,8 @@ static void noise_handshake_split(struct noise_state *st)
 	st->recv.cs.has_key = true;
 
 	memzero_explicit(&st->hs.ss, sizeof(st->hs.ss));
-	memzero_explicit(&st->hs.loc_ephem, sizeof(&st->hs.loc_ephem));
-	memzero_explicit(&st->hs.rem_ephem, sizeof(&st->hs.rem_ephem));
+	memzero_explicit(&st->hs.loc_ephem, sizeof(st->hs.loc_ephem));
+	memzero_explicit(&st->hs.rem_ephem, sizeof(st->hs.rem_ephem));
 }
 
 static void rekey(struct noise_cipher_state *cs)
@@ -309,7 +309,7 @@ bool noise_decrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len, u8 *out)
 {
 	BUG_ON(!st->recv.cs.has_key);
-	if (!chacha20poly1305_decrypt(out, in, in_len, NULL 0,
+	if (!chacha20poly1305_decrypt(out, in, in_len, NULL, 0,
 				st->recv.cs.counter, st->recv.cs.key))
 		return false;
 	st->recv.cs.counter ++;
@@ -322,7 +322,7 @@ void noise_encrypt_transport_message(struct noise_state *st,
 {
 	BUG_ON(!st->recv.cs.has_key);
 	chacha20poly1305_encrypt(out, in, in_len, NULL, 0,
-			st->send.cs.counter, st->send.cs.key)
+			st->send.cs.counter, st->send.cs.key);
 	st->send.cs.counter ++;
 	rekey(&st->send.cs);
 }

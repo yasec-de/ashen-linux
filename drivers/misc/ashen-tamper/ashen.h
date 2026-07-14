@@ -8,7 +8,7 @@
 #define __ASHEN_H__
 
 enum ashen_connstate {
-	CONN_DICONNECTED,
+	CONN_DISCONNECTED,
 	CONN_HANDSHAKE,
 	CONN_CONNECTED,
 };
@@ -18,7 +18,7 @@ struct ashen_tamper {
 	struct serdev_device *serdev;
 	spinlock_t noise_lock; /* noise state machine lock */
 	struct noise_state noise_st;
-	enum ashen_connstate noise_state;
+	enum ashen_connstate conn_st;
 	struct completion connection_ready;
 	struct completion packet_ready;
 	ktime_t timeout_min;
