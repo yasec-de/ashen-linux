@@ -8,7 +8,7 @@ ashen-tamper-y :=	cobs.o		\
 			ashen.o
 
 # The test links the protocol objects (no ashen.o/serdev) into its own module,
-# so it builds under KUnit's UML target and needs no EXPORT_SYMBOLs.
+# so it builds under KUnit's UML target
 obj-$(CONFIG_ASHEN_TAMPER_KUNIT_TEST) += ashen-protocol-test.o
 ashen-protocol-test-y :=	protocol_kunit.o	\
 				cobs.o			\

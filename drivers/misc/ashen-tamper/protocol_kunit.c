@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KUnit tests for the ashen-tamper protocol logic above serdev: COBS framing,
- * frame reassembly, and the Noise_XX handshake + transport. Two noise_state
- * instances (initiator + responder) talk to each other through the real COBS
- * framer, so the full stack minus serdev is exercised end to end.
- *
  * Copyright (C) Yasec / Jan Sebastian Götte 2026
  * Author:       Jan Sebastian Götte <kernel@yasec.de>
  */
@@ -26,7 +21,7 @@ static void test_cobs_roundtrip(struct kunit *test)
 		size_t len;
 	} vecs[] = {
 		{ "empty",       {},               0 },
-		{ "single-zero", { 0x00 },         1 },
+		{ "single-zero", { 0 },         1 },
 		{ "all-zeros",   { 0 },            8 }, /* 8 zero bytes */
 		{ "no-zeros",    { 1, 2, 3, 4, 5 }, 5 },
 		{ "mixed",       { 0, 1, 0, 2, 3, 0, 0, 4 }, 8 },
@@ -310,7 +305,7 @@ static void test_framer_chunked(struct kunit *test)
 	w2 = make_wire(test, p2, sizeof(p2), wire + w1, sizeof(wire) - w1);
 	total = w1 + w2;
 
-	/* feed one byte at a time to stress reassembly across boundaries */
+	/* test reassembly by pushing byte by byte */
 	for (i = 0; i < total; i++)
 		KUNIT_EXPECT_EQ(test, ashen_framer_push(f, wire + i, 1), 1);
 
@@ -334,13 +329,11 @@ static void test_framer_overrun(struct kunit *test)
 	cap->test = test;
 	f = make_framer(test, cap);
 
-	/* a huge run of non-delimiter bytes: overruns, must resync */
 	memset(junk, 0xFF, sizeof(junk));
 	ashen_framer_push(f, junk, sizeof(junk));
 	KUNIT_EXPECT_EQ(test, cap->count, 0);
 	KUNIT_EXPECT_FALSE(test, f->sync);
 
-	/* a following valid frame still decodes */
 	wlen = make_wire(test, payload, sizeof(payload), wire, sizeof(wire));
 	ashen_framer_push(f, wire, wlen);
 	KUNIT_ASSERT_EQ(test, cap->count, 1);
@@ -362,7 +355,7 @@ static void test_framer_truncated(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cap->count, 0); /* dropped, no frame delivered */
 }
 
-/* ---- End to end: two instances through framer + COBS + noise ---- */
+/* ---- end to end ---- */
 
 static void test_e2e_two_instances(struct kunit *test)
 {
@@ -449,5 +442,5 @@ static struct kunit_suite ashen_protocol_suite = {
 };
 kunit_test_suite(ashen_protocol_suite);
 
-MODULE_DESCRIPTION("KUnit tests for ashen-tamper protocol (COBS + Noise)");
+MODULE_DESCRIPTION("KUnit tests for ashen-tamper protocol");
 MODULE_LICENSE("GPL");

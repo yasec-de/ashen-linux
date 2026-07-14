@@ -14,20 +14,20 @@ static size_t ashen_framer_chunk(struct ashen_framer *f,
 {
 	ssize_t len;
 	size_t nul_pos = strnlen(buf, size);
-	bool frame_complete = nul_pos < size;
+	bool found_null = nul_pos < size;
 
 	if (f->len + nul_pos > f->cap) {
 		f->sync = false;
 		f->len = 0;
 		pr_warn("ashen-tamper: receive buffer overrun\n");
 		/* drop this chunk; also skip the delimiter if we saw one */
-		return nul_pos + frame_complete;
+		return nul_pos + found_null;
 	}
 
 	memcpy(f->buf + f->len, buf, nul_pos);
 	f->len += nul_pos;
 
-	if (!frame_complete)
+	if (!found_null)
 		return size;
 
 	/* frame complete. decode in place. */

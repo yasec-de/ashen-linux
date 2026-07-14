@@ -17,15 +17,16 @@ enum ashen_connstate {
 
 struct ashen_tamper {
 	struct hrtimer hb_timer;
+	struct hrtimer refresh_timer;
 	struct serdev_device *serdev;
 	spinlock_t noise_lock; /* noise state machine lock */
 	struct noise_state noise_st;
 	enum ashen_connstate conn_st;
 	struct completion connection_ready;
 	struct completion packet_ready;
-	ktime_t timeout_min;
-	ktime_t slack_min;
+	ktime_t refresh_ivl;
 	ktime_t timeout;
+	bool autostart;
 	struct ashen_framer *framer;
 	struct mutex tx_lock;
 	unsigned char tx_buf[256];
