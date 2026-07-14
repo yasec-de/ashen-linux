@@ -10,8 +10,10 @@
 #include <linux/of.h>
 #include <linux/serdev.h>
 #include <linux/sysfs.h>
+#include <linux/overflow.h>
 #include "cobs.h"
 #include "noise.h"
+#include "framing.h"
 #include "ashen.h"
 
 #define ASHEN_TAMPER_DEFAULT_BAUDRATE 1000000
@@ -19,6 +21,7 @@
 #define ASHEN_TAMPER_DEFAULT_TIMEOUT_MIN_US 10000
 #define ASHEN_TAMPER_DEFAULT_SLACK_MIN_US 5000
 #define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
+#define ASHEN_TAMPER_RX_BUF_SIZE 256
 
 static bool panic_on_error;
 
@@ -66,6 +69,8 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 static void ashen_receive_packet(struct ashen_tamper *ash,
 		const u8 *buf, size_t len)
 {
+	u8 *frame = (u8 *)buf; /* framer buffer, in-place decrypt is fine */
+
 	switch (ash->conn_st) {
 	case CONN_DISCONNECTED:
 		pr_warn("ashen-tamper: received out-of-order message from device\n");
@@ -74,66 +79,28 @@ static void ashen_receive_packet(struct ashen_tamper *ash,
 		ashen_continue_handshake(ash, buf, len);
 		break;
 	case CONN_CONNECTED:
+		if (len < NOISE_MAC_LEN)
+			break;
 		if (!noise_decrypt_transport_message(&ash->noise_st,
-					ash->rx_buf, ash->rx_len, ash->rx_buf))
+					frame, len, frame))
 			break;
 
-		ashen_handle_packet(ash,
-				ash->rx_buf, ash->rx_len - NOISE_MAC_LEN);
+		ashen_handle_packet(ash, frame, len - NOISE_MAC_LEN);
 		break;
 	}
 }
 
-static size_t ashen_receive_chunk(struct ashen_tamper *ash,
-		const u8 *buf, size_t size)
+static void ashen_on_frame(void *ctx, const u8 *frame, size_t len)
 {
-	ssize_t len;
-	size_t nul_pos = strnlen(buf, size);
-	bool frame_complete = nul_pos < size;
-
-	if (ash->rx_len + nul_pos > ARRAY_SIZE(ash->rx_buf)) {
-		ash->rx_sync = false;
-		ash->rx_len = 0;
-		pr_warn("ashen-tamper: receive buffer overrun\n");
-		/* drop this chunk; also skip the delimiter if we saw one */
-		return nul_pos + frame_complete;
-	}
-
-	memcpy(ash->rx_buf + ash->rx_len, buf, nul_pos);
-	ash->rx_len += nul_pos;
-
-	if (!frame_complete)
-		return size;
-
-	/* frame complete. decode in place. */
-	len = cobs_decode(ash->rx_buf, ash->rx_len,
-			ash->rx_buf, ARRAY_SIZE(ash->rx_buf));
-	if (len >= 0) {
-		ashen_receive_packet(ash, ash->rx_buf, len);
-	} else if (len == -EINTR) {
-		pr_warn("ashen-tamper: truncated frame received\n");
-		/* no point in resetting ash->rx_sync here since we already
-		 * received the next null byte, so we are synced. */
-	}/* else: consecutive null bytes received. Technically, a valid empty
-	     frame is [0x01 0x00], not just [0x00]. We ignore this here since
-	     runs of null bytes are useful for initial sync. */
-	ash->rx_len = 0;
-	return nul_pos + 1; /* consume the delimiter too */
+	ashen_receive_packet(ctx, frame, len);
 }
 
 static size_t ashen_receive(struct serdev_device *serdev,
 		const u8 *buf, size_t size)
 {
 	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
-	size_t consumed = 0;
-	size_t chunk;
 
-	while (size && (chunk = ashen_receive_chunk(ash, buf, size))) {
-		buf += chunk;
-		size -= chunk;
-		consumed += chunk;
-	}
-	return consumed;
+	return ashen_framer_push(ash->framer, buf, size);
 }
 
 static const struct serdev_device_ops ashen_serdev_ops = {
@@ -222,6 +189,17 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	ash->serdev = serdev;
 	serdev_device_set_drvdata(serdev, ash);
 	serdev_device_set_client_ops(serdev, &ashen_serdev_ops);
+
+	ash->framer = devm_kzalloc(&serdev->dev,
+			struct_size(ash->framer, buf, ASHEN_TAMPER_RX_BUF_SIZE),
+			GFP_KERNEL);
+	if (!ash->framer) {
+		ret = -ENOMEM;
+		goto error;
+	}
+	ash->framer->cap = ASHEN_TAMPER_RX_BUF_SIZE;
+	ash->framer->on_frame = ashen_on_frame;
+	ash->framer->ctx = ash;
 
 	of_property_read_u32(serdev->dev.of_node, "current-speed", &speed);
 

@@ -7,6 +7,8 @@
 #ifndef __ASHEN_H__
 #define __ASHEN_H__
 
+#include "framing.h"
+
 enum ashen_connstate {
 	CONN_DISCONNECTED,
 	CONN_HANDSHAKE,
@@ -24,10 +26,8 @@ struct ashen_tamper {
 	ktime_t timeout_min;
 	ktime_t slack_min;
 	ktime_t timeout;
-	bool rx_sync;
-	size_t rx_len;
+	struct ashen_framer *framer;
 	struct mutex tx_lock;
-	unsigned char rx_buf[256];
 	unsigned char tx_buf[256];
 };
 

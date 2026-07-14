@@ -76,3 +76,4 @@ obj-y				+= amd-sbi/
 obj-$(CONFIG_MISC_RP1)		+= rp1/
 obj-$(CONFIG_INTEL_SSEI)	+= issei/
 obj-$(CONFIG_ASHEN_TAMPER)	+= ashen-tamper/
+obj-$(CONFIG_ASHEN_TAMPER_KUNIT_TEST)	+= ashen-tamper/

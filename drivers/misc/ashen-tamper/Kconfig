@@ -11,3 +11,15 @@ config ASHEN_TAMPER
 	  Enables Ashen tamper sensor heartbeat protocol support. The driver
 	  supports a configurable numer of UART heartbeat links, as well as a
 	  configurable number of GPIO tamper inputs.
+
+config ASHEN_TAMPER_KUNIT_TEST
+	tristate "KUnit tests for Ashen tamper protocol" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select CRYPTO_LIB_CURVE25519
+	select CRYPTO_LIB_CHACHA20POLY1305
+	default KUNIT_ALL_TESTS
+	help
+	  Protocol-level tests (COBS framing + Noise handshake/transport)
+	  for the ashen-tamper driver. The test compiles the protocol sources
+	  directly, so it does not need the serdev-based driver and builds under
+	  the UML KUnit target. Say N unless you are testing.
