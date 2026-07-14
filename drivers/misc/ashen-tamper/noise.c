@@ -16,8 +16,10 @@
  * -> s, se			message "c"
  */
 
-static const u8 handshake_name[37] __nonstring = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
-static const u8 identifier_name[34] __nonstring = "Ashen v1 jaseg jan@yasec.de";
+/* Hashed as-is per Noise; sizes exclude the terminating NUL so no zero padding
+ * leaks into the transcript. The device firmware must hash the identical bytes. */
+static const u8 handshake_name[33] __nonstring = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+static const u8 identifier_name[27] __nonstring = "Ashen v1 jaseg jan@yasec.de";
 
 static void mix_hash(struct noise_handshake_state *st, const u8 *src, size_t src_len)
 {
@@ -320,7 +322,7 @@ bool noise_decrypt_transport_message(struct noise_state *st,
 void noise_encrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len, u8 *out)
 {
-	BUG_ON(!st->recv.cs.has_key);
+	BUG_ON(!st->send.cs.has_key);
 	chacha20poly1305_encrypt(out, in, in_len, NULL, 0,
 			st->send.cs.counter, st->send.cs.key);
 	st->send.cs.counter ++;
@@ -328,40 +330,50 @@ void noise_encrypt_transport_message(struct noise_state *st,
 }
 
 static ssize_t noise_handshake_initiator(struct noise_state *st,
-	const u8 *in, size_t in_len, u8 out[static NOISE_MAX_HS_MSG_LEN])
+	const u8 *in, size_t in_len, u8 out[static NOISE_MAX_HS_MSG_LEN],
+	bool *done)
 {
+	ssize_t ret;
+
 	switch(st->hs.message_count) {
 		case 0:
 			return noise_handshake_write_msg_a(&st->hs, out);
 		case 1:
 			if (in_len != 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN)
 				return -EINVAL;
-			noise_handshake_read_msg_b(&st->hs, in);
-			return noise_handshake_write_msg_c(&st->hs, out);
-		case 2:
+			if (!noise_handshake_read_msg_b(&st->hs, in))
+				return -EBADMSG;
+			ret = noise_handshake_write_msg_c(&st->hs, out);
+			if (ret < 0)
+				return ret;
+			/* msg c is the last: once it's on the wire we're done */
 			noise_handshake_split(st);
-			return 0;
+			*done = true;
+			return ret;
 		default:
 			return -EINVAL;
 	}
 }
 
 static ssize_t noise_handshake_responder(struct noise_state *st,
-	const u8 *in, size_t in_len, u8 out[static NOISE_MAX_HS_MSG_LEN])
+	const u8 *in, size_t in_len, u8 out[static NOISE_MAX_HS_MSG_LEN],
+	bool *done)
 {
 	switch(st->hs.message_count) {
 	case 0:
 		if (in_len != NOISE_PUBLIC_KEY_LEN)
 			return -EINVAL;
-		noise_handshake_read_msg_a(&st->hs, in);
+		if (!noise_handshake_read_msg_a(&st->hs, in))
+			return -EBADMSG;
 		return noise_handshake_write_msg_b(&st->hs, out);
 	case 1:
 		if (in_len != NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN)
 			return -EINVAL;
-		noise_handshake_read_msg_c(&st->hs, in);
-		return noise_handshake_write_msg_c(&st->hs, out);
-	case 2:
+		if (!noise_handshake_read_msg_c(&st->hs, in))
+			return -EBADMSG;
+		/* handshake complete: derive transport keys, no reply to send */
 		noise_handshake_split(st);
+		*done = true;
 		return 0;
 	default:
 		return -EINVAL;
@@ -369,13 +381,15 @@ static ssize_t noise_handshake_responder(struct noise_state *st,
 }
 
 ssize_t noise_handshake(struct noise_state *st, const u8 *in, size_t in_len,
-		u8 out[static NOISE_MAX_HS_MSG_LEN])
+		u8 out[static NOISE_MAX_HS_MSG_LEN], bool *done)
 {
 	ssize_t ret = -EINVAL;
+
+	*done = false;
 	if (st->hs.i_am_the_initiator)
-		ret = noise_handshake_initiator(st, in, in_len, out);
+		ret = noise_handshake_initiator(st, in, in_len, out, done);
 	else
-		ret = noise_handshake_responder(st, in, in_len, out);
+		ret = noise_handshake_responder(st, in, in_len, out, done);
 
 	if (ret < 0) {
 		memzero_explicit(&st->hs.ss, sizeof(st->hs.ss));

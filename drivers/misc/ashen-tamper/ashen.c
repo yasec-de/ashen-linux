@@ -28,29 +28,33 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 {
 	ssize_t ret;
 	ssize_t to_write;
+	bool done = false;
 
-	ret = noise_handshake(&ash->noise_st, buf, len, ash->tx_buf);
+	ret = noise_handshake(&ash->noise_st, buf, len, ash->tx_buf, &done);
 	if (ret < 0) {
 		pr_err("ashen-tamper: noise handshake error\n");
 		ash->conn_st = CONN_DISCONNECTED;
 		return;
-	} else if (ret == 0) {
-		complete(&ash->connection_ready);
-		ash->conn_st = CONN_CONNECTED;
-		return;
-	} /* else: ret > 0 */
+	}
 	to_write = ret;
 
-	ret = serdev_device_write(ash->serdev, ash->tx_buf, to_write,
-			ASHEN_TAMPER_SERDEV_TIMEOUT);
-	if (ret != to_write) {
-		if (ret == -ETIMEDOUT || ret == -ERESTARTSYS)
-			pr_err("ashen-tamper: timeout during handshake\n");
-		else
-			pr_err("ashen-tamper: I/O error during handshake\n");
-		ash->conn_st = CONN_DISCONNECTED;
-		return;
-	} 
+	if (to_write) {
+		ret = serdev_device_write(ash->serdev, ash->tx_buf, to_write,
+				ASHEN_TAMPER_SERDEV_TIMEOUT);
+		if (ret != to_write) {
+			if (ret == -ETIMEDOUT || ret == -ERESTARTSYS)
+				pr_err("ashen-tamper: timeout during handshake\n");
+			else
+				pr_err("ashen-tamper: I/O error during handshake\n");
+			ash->conn_st = CONN_DISCONNECTED;
+			return;
+		}
+	}
+
+	if (done) {
+		ash->conn_st = CONN_CONNECTED;
+		complete(&ash->connection_ready);
+	}
 }
 
 static void ashen_handle_packet(struct ashen_tamper *ash,
@@ -85,18 +89,21 @@ static size_t ashen_receive_chunk(struct ashen_tamper *ash,
 {
 	ssize_t len;
 	size_t nul_pos = strnlen(buf, size);
+	bool frame_complete = nul_pos < size;
+
 	if (ash->rx_len + nul_pos > ARRAY_SIZE(ash->rx_buf)) {
 		ash->rx_sync = false;
+		ash->rx_len = 0;
 		pr_warn("ashen-tamper: receive buffer overrun\n");
-		return nul_pos;
+		/* drop this chunk; also skip the delimiter if we saw one */
+		return nul_pos + frame_complete;
 	}
 
 	memcpy(ash->rx_buf + ash->rx_len, buf, nul_pos);
 	ash->rx_len += nul_pos;
 
-	if (nul_pos == size) {
-		return nul_pos;
-	}
+	if (!frame_complete)
+		return size;
 
 	/* frame complete. decode in place. */
 	len = cobs_decode(ash->rx_buf, ash->rx_len,
@@ -111,7 +118,7 @@ static size_t ashen_receive_chunk(struct ashen_tamper *ash,
 	     frame is [0x01 0x00], not just [0x00]. We ignore this here since
 	     runs of null bytes are useful for initial sync. */
 	ash->rx_len = 0;
-	return nul_pos;
+	return nul_pos + 1; /* consume the delimiter too */
 }
 
 static size_t ashen_receive(struct serdev_device *serdev,
@@ -227,6 +234,10 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	ash->slack_min = us_to_ktime(val);
 
 	ash->timeout = 0;
+	ash->conn_st = CONN_HANDSHAKE;
+	init_completion(&ash->connection_ready);
+	init_completion(&ash->packet_ready);
+	mutex_init(&ash->tx_lock);
 
 	hrtimer_setup(&ash->hb_timer, ash_hb_timer_fn, CLOCK_MONOTONIC,
 			HRTIMER_MODE_REL_HARD);
@@ -240,7 +251,6 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	speed = serdev_device_set_baudrate(serdev, speed);
 	dev_info(&serdev->dev, "Using baudrate: %u\n", speed);
 	serdev_device_set_flow_control(serdev, false);
-	mutex_init(&ash->tx_lock);
 	return 0;
 error:
 	if (panic_on_error)
@@ -250,6 +260,9 @@ error:
 
 static void ashen_tamper_remove(struct serdev_device *serdev)
 {
+	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
+
+	hrtimer_cancel(&ash->hb_timer);
 	/* Flush any pending characters in the driver. */
 	serdev_device_close(serdev);
 }

@@ -80,7 +80,7 @@ bool noise_handshake_read_msg_c(struct noise_handshake_state *st,
 		const u8 in[static NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN]);
 
 ssize_t noise_handshake(struct noise_state *st, const u8 *in, size_t in_len,
-		u8 out[static NOISE_MAX_HS_MSG_LEN]);
+		u8 out[static NOISE_MAX_HS_MSG_LEN], bool *done);
 
 bool noise_decrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len,
