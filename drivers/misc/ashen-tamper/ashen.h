@@ -7,7 +7,9 @@
 #ifndef __ASHEN_H__
 #define __ASHEN_H__
 
+#include <linux/workqueue.h>
 #include "framing.h"
+#include "noise.h"
 
 enum ashen_connstate {
 	CONN_DISCONNECTED,
@@ -15,11 +17,20 @@ enum ashen_connstate {
 	CONN_CONNECTED,
 };
 
+/* Large enough for both a plaintext message and a raw handshake message. */
+#define ASHEN_TX_MAX_PAYLOAD NOISE_MAX_HS_MSG_LEN
+#define ASHEN_TX_QUEUE_LEN 8
+
+struct ashen_tx_req {
+	u8 payload[ASHEN_TX_MAX_PAYLOAD];
+	size_t len;
+	bool raw; /* write verbatim (handshake), do not noise-encrypt */
+};
+
 struct ashen_tamper {
 	struct hrtimer hb_timer;
 	struct hrtimer refresh_timer;
 	struct serdev_device *serdev;
-	spinlock_t noise_lock; /* noise state machine lock */
 	struct noise_state noise_st;
 	enum ashen_connstate conn_st;
 	struct completion connection_ready;
@@ -28,7 +39,15 @@ struct ashen_tamper {
 	ktime_t timeout;
 	bool autostart;
 	struct ashen_framer *framer;
-	struct mutex tx_lock;
+
+	struct work_struct tx_work;
+	struct workqueue_struct *tx_wq;
+	spinlock_t tx_queue_lock; /* protects tx_queue, tx_head, tx_tail */
+	struct ashen_tx_req tx_queue[ASHEN_TX_QUEUE_LEN];
+	unsigned int tx_head;
+	unsigned int tx_tail;
+
+	struct mutex tx_lock; /* serialises noise send state + serdev write */
 	unsigned char tx_buf[256];
 };
 
