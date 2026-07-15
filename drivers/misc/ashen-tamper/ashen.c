@@ -18,7 +18,6 @@
 #include "ashen.h"
 
 #define ASHEN_TAMPER_DEFAULT_BAUDRATE 1000000
-#define ASHEN_TAMPER_MAX_BUF_SIZE 8192
 #define ASHEN_TAMPER_DEFAULT_TIMEOUT_US 10000
 #define ASHEN_TAMPER_DEFAULT_REFRESH_IVL_US 5000
 #define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
@@ -178,13 +177,17 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 	case ASHEN_MSG_PAIR_RESPONSE: {
 		const struct ashen_msg_pair_response *msg = (const void *)buf;
 		u8 type;
+		int ret;
 
 		if (len != sizeof(*msg))
 			goto malformed;
 		pr_info("ashen-tamper: pairing successful\n");
 
 		type = ASHEN_MSG_STATUS_REQUEST;
-		ash_send_envelope(ash, &type, sizeof(type));
+		ret = ash_send_envelope(ash, &type, sizeof(type));
+		if (ret)
+			pr_warn("ashen-tamper: failed to send status request: %d\n",
+					ret);
 		break;
 	}
 	case ASHEN_MSG_STATUS_RESPONSE: {
@@ -206,9 +209,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 		if (delta_ns > ktime_to_ns(ash->timeout)) {
 			pr_warn("ashen-tamper: received echo response stale by %llu ns", delta_ns);
 		} else {
-			/* Push the deadline out. hrtimer_forward_now() only
-			 * adjusts the expiry of a timer from inside its own
-			 * callback; re-arming from here needs hrtimer_start(). */
+			/* Restart the timer. */
 			hrtimer_start(&ash->hb_timer, ash->timeout,
 					HRTIMER_MODE_REL_HARD);
 		}
@@ -279,8 +280,6 @@ static const struct of_device_id ashen_tamper_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, ashen_tamper_of_match);
 
-/* Reaching this means no valid echo response re-armed the timer within the
- * timeout, i.e. the heartbeat link to the tamper sensor is gone. */
 static enum hrtimer_restart
 ash_hb_timer_fn(struct hrtimer *t)
 {
@@ -296,7 +295,11 @@ ash_refresh_timer_fn(struct hrtimer *t)
 		.type = ASHEN_MSG_ECHO_REQUEST,
 		.value = cpu_to_be64(ktime_get_ns()),
 	};
-	ash_send_envelope(ash, &msg, sizeof(msg));
+
+	if (ash_send_envelope(ash, &msg, sizeof(msg)))
+		pr_warn_ratelimited("ashen-tamper: failed to queue echo request\n");
+
+	hrtimer_forward_now(t, ash->refresh_ivl);
 	return HRTIMER_RESTART;
 }
 
@@ -463,19 +466,10 @@ error:
 static void ashen_tamper_remove(struct serdev_device *serdev)
 {
 	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
-
-	/* Stop the timers before they can queue more work. */
 	hrtimer_cancel(&ash->refresh_timer);
 	hrtimer_cancel(&ash->hb_timer);
-
-	if (ash->conn_st == CONN_CONNECTED) {
-		u8 type = ASHEN_MSG_DISCONNECT;
-		ash_send_envelope(ash, &type, sizeof(type));
-	}
-
-	/* Drain the disconnect message before tearing the link down. */
-	destroy_workqueue(ash->tx_wq);
 	serdev_device_close(serdev);
+	destroy_workqueue(ash->tx_wq);
 }
 
 static struct serdev_device_driver ashen_tamper_driver = {
