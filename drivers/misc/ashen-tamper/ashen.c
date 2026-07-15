@@ -23,23 +23,15 @@
 #define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
 #define ASHEN_TAMPER_RX_BUF_SIZE 256
 
-static bool panic_on_error;
-
 static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
 {
 	u8 wire[sizeof(ash->tx_buf)];
-	size_t clen;
 	ssize_t encoded;
-	ssize_t ret;
+	int ret;
+	ssize_t written;
+	size_t clen = req->len + NOISE_MAC_LEN;
 
 	mutex_lock(&ash->tx_lock);
-
-	clen = req->len + NOISE_MAC_LEN;
-	if (clen + clen / 254 + 2 > sizeof(wire)) {
-		ret = -EMSGSIZE;
-		goto out;
-	}
-
 	noise_encrypt_transport_message(&ash->noise_st, req->payload, req->len,
 			ash->tx_buf);
 	encoded = cobs_encode(ash->tx_buf, clen, wire, sizeof(wire));
@@ -48,10 +40,10 @@ static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
 		goto out;
 	}
 
-	ret = serdev_device_write(ash->serdev, wire, encoded,
+	written = serdev_device_write(ash->serdev, wire, encoded,
 			ASHEN_TAMPER_SERDEV_TIMEOUT);
-	if (ret != encoded)
-		ret = ret < 0 ? ret : -EIO;
+	if (written != encoded)
+		ret = written < 0 ? written : -EIO;
 	else
 		ret = 0;
 
@@ -460,8 +452,6 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 error_wq:
 	destroy_workqueue(ash->tx_wq);
 error:
-	if (panic_on_error)
-		panic("ashen-tamper initialization failure");
 	return ret;
 }
 
@@ -486,7 +476,6 @@ static struct serdev_device_driver ashen_tamper_driver = {
 
 module_serdev_device_driver(ashen_tamper_driver);
 
-module_param(panic_on_error, bool, 0644);
 MODULE_DESCRIPTION("Ashen tamper sensor heartbeat protocol driver");
 MODULE_AUTHOR("Yasec");
 MODULE_AUTHOR("Jan Sebastian Götte <kernel@yasec.de>");
