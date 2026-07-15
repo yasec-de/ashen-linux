@@ -7,6 +7,7 @@
 #ifndef __ASHEN_H__
 #define __ASHEN_H__
 
+#include <linux/kfifo.h>
 #include <linux/workqueue.h>
 #include "framing.h"
 #include "noise.h"
@@ -40,10 +41,8 @@ struct ashen_tamper {
 
 	struct work_struct tx_work;
 	struct workqueue_struct *tx_wq;
-	spinlock_t tx_queue_lock; /* protects tx_queue, tx_head, tx_tail */
-	struct ashen_tx_req tx_queue[ASHEN_TX_QUEUE_LEN];
-	unsigned int tx_head;
-	unsigned int tx_tail;
+	spinlock_t tx_queue_lock;
+	DECLARE_KFIFO(tx_queue, struct ashen_tx_req, ASHEN_TX_QUEUE_LEN);
 
 	struct mutex tx_lock; /* serialises noise send state + serdev write */
 	unsigned char tx_buf[256];

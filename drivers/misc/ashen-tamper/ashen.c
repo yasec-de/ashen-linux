@@ -65,21 +65,19 @@ static void ash_tx_work_fn(struct work_struct *w)
 	struct ashen_tamper *ash = container_of(w, struct ashen_tamper, tx_work);
 	struct ashen_tx_req req;
 	unsigned long flags;
+	bool ok;
 	int ret;
 
 	for (;;) {
 		spin_lock_irqsave(&ash->tx_queue_lock, flags);
-		if (ash->tx_head == ash->tx_tail) {
-			spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
-			return;
-		}
-		req = ash->tx_queue[ash->tx_tail % ASHEN_TX_QUEUE_LEN];
-		ash->tx_tail++;
+		ok = kfifo_get(&ash->tx_queue, &req);
 		spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
+		if (!ok)
+			return;
 
 		ret = ash_tx_one(ash, &req);
 		if (ret)
-			pr_err("ashen-tamper: tx failed: %d\n", ret);
+			dev_err(&ash->serdev->dev, "tx failed: %d\n", ret);
 	}
 }
 
@@ -87,28 +85,25 @@ static void ash_tx_work_fn(struct work_struct *w)
 static int ash_send_envelope(struct ashen_tamper *ash,
 		const void *msg, size_t len)
 {
-	struct ashen_tx_req *slot;
+	struct ashen_tx_req req;
 	unsigned long flags;
-	int ret = 0;
+	bool ok;
 
 	if (len > ASHEN_TX_MAX_PAYLOAD)
 		return -EMSGSIZE;
 
+	memcpy(req.payload, msg, len);
+	req.len = len;
+
 	spin_lock_irqsave(&ash->tx_queue_lock, flags);
-	if (ash->tx_head - ash->tx_tail >= ASHEN_TX_QUEUE_LEN) {
-		ret = -ENOSPC;
-		goto out;
-	}
-	slot = &ash->tx_queue[ash->tx_head % ASHEN_TX_QUEUE_LEN];
-	memcpy(slot->payload, msg, len);
-	slot->len = len;
-	ash->tx_head++;
-out:
+	ok = kfifo_put(&ash->tx_queue, req);
 	spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
 
-	if (!ret)
-		queue_work(ash->tx_wq, &ash->tx_work);
-	return ret;
+	if (!ok)
+		return -ENOSPC;
+
+	queue_work(ash->tx_wq, &ash->tx_work);
+	return 0;
 }
 
 static void ashen_continue_handshake(struct ashen_tamper *ash,
@@ -122,7 +117,7 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 
 	ret = noise_handshake(&ash->noise_st, buf, len, hs_msg, &done);
 	if (ret < 0) {
-		pr_err("ashen-tamper: noise handshake error\n");
+		dev_err(&ash->serdev->dev, "noise handshake error\n");
 		ash->conn_st = CONN_DISCONNECTED;
 		return;
 	}
@@ -133,9 +128,9 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 				ASHEN_TAMPER_SERDEV_TIMEOUT);
 		if (ret != to_write) {
 			if (ret == -ETIMEDOUT || ret == -ERESTARTSYS)
-				pr_err("ashen-tamper: timeout during handshake\n");
+				dev_err(&ash->serdev->dev, "timeout during handshake\n");
 			else
-				pr_err("ashen-tamper: I/O error during handshake\n");
+				dev_err(&ash->serdev->dev, "I/O error during handshake\n");
 			ash->conn_st = CONN_DISCONNECTED;
 			return;
 		}
@@ -153,8 +148,8 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 		type = ASHEN_MSG_STATUS_REQUEST;
 		ret = ash_send_envelope(ash, &type, sizeof(type));
 		if (ret)
-			pr_err("ashen-tamper: failed to send status request: %zd\n",
-					ret);
+			dev_err(&ash->serdev->dev,
+					"failed to send status request: %zd\n", ret);
 	}
 }
 
@@ -163,7 +158,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 {
 	u64 delta_ns;
 	if (len < 1) {
-		pr_warn("ashen-tamper: empty message\n");
+		dev_warn(&ash->serdev->dev, "empty message\n");
 		return;
 	}
 
@@ -181,13 +176,13 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 
 		if (len != sizeof(*msg))
 			goto malformed;
-		pr_info("ashen-tamper: pairing successful\n");
+		dev_info(&ash->serdev->dev, "pairing successful\n");
 
 		type = ASHEN_MSG_STATUS_REQUEST;
 		ret = ash_send_envelope(ash, &type, sizeof(type));
 		if (ret)
-			pr_warn("ashen-tamper: failed to send status request: %d\n",
-					ret);
+			dev_warn(&ash->serdev->dev,
+					"failed to send status request: %d\n", ret);
 		break;
 	}
 	case ASHEN_MSG_STATUS_RESPONSE: {
@@ -195,7 +190,8 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 
 		if (len != sizeof(*msg))
 			goto malformed;
-		pr_info("ashen-tamper: status: peer_trusted=%d is_keyed=%d\n",
+		dev_info(&ash->serdev->dev,
+				"status: peer_trusted=%d is_keyed=%d\n",
 				msg->peer_trusted, msg->is_keyed);
 		break;
 	}
@@ -207,7 +203,9 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 
 		delta_ns = ktime_get_ns() - be64_to_cpu(msg->value);
 		if (delta_ns > ktime_to_ns(ash->timeout)) {
-			pr_warn("ashen-tamper: received echo response stale by %llu ns", delta_ns);
+			dev_warn(&ash->serdev->dev,
+					"received echo response stale by %llu ns\n",
+					delta_ns);
 		} else {
 			/* Restart the timer. */
 			hrtimer_start(&ash->hb_timer, ash->timeout,
@@ -224,7 +222,8 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 		ash->conn_st = CONN_DISCONNECTED;
 		break;
 	default:
-		pr_warn("ashen-tamper: unexpected message type %d\n", buf[0]);
+		dev_warn(&ash->serdev->dev, "unexpected message type %d\n",
+				buf[0]);
 		break;
 	}
 
@@ -232,7 +231,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 	return;
 
 malformed:
-	pr_warn("ashen-tamper: malformed message type %d\n", buf[0]);
+	dev_warn(&ash->serdev->dev, "malformed message type %d\n", buf[0]);
 }
 
 static void ashen_receive_packet(void *ctx,
@@ -243,7 +242,8 @@ static void ashen_receive_packet(void *ctx,
 
 	switch (ash->conn_st) {
 	case CONN_DISCONNECTED:
-		pr_warn("ashen-tamper: received out-of-order message from device\n");
+		dev_warn(&ash->serdev->dev,
+				"received out-of-order message from device\n");
 		break;
 	case CONN_HANDSHAKE:
 		ashen_continue_handshake(ash, buf, len);
@@ -297,7 +297,8 @@ ash_refresh_timer_fn(struct hrtimer *t)
 	};
 
 	if (ash_send_envelope(ash, &msg, sizeof(msg)))
-		pr_warn_ratelimited("ashen-tamper: failed to queue echo request\n");
+		dev_warn_ratelimited(&ash->serdev->dev,
+				"failed to queue echo request\n");
 
 	hrtimer_forward_now(t, ash->refresh_ivl);
 	return HRTIMER_RESTART;
@@ -429,6 +430,7 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	}
 
 	spin_lock_init(&ash->tx_queue_lock);
+	INIT_KFIFO(ash->tx_queue);
 	INIT_WORK(&ash->tx_work, ash_tx_work_fn);
 	ash->tx_wq = alloc_ordered_workqueue("ashen-tamper-tx", WQ_MEM_RECLAIM);
 	if (!ash->tx_wq) {
