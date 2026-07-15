@@ -17,14 +17,12 @@ enum ashen_connstate {
 	CONN_CONNECTED,
 };
 
-/* Large enough for both a plaintext message and a raw handshake message. */
-#define ASHEN_TX_MAX_PAYLOAD NOISE_MAX_HS_MSG_LEN
+#define ASHEN_TX_MAX_PAYLOAD 16
 #define ASHEN_TX_QUEUE_LEN 8
 
 struct ashen_tx_req {
 	u8 payload[ASHEN_TX_MAX_PAYLOAD];
 	size_t len;
-	bool raw; /* write verbatim (handshake), do not noise-encrypt */
 };
 
 struct ashen_tamper {

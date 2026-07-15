@@ -26,7 +26,6 @@
 
 static bool panic_on_error;
 
-/* Encrypt, frame and write one queued request. Sleeps: process context only. */
 static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
 {
 	u8 wire[sizeof(ash->tx_buf)];
@@ -35,16 +34,6 @@ static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
 	ssize_t ret;
 
 	mutex_lock(&ash->tx_lock);
-
-	if (req->raw) {
-		ret = serdev_device_write(ash->serdev, req->payload, req->len,
-				ASHEN_TAMPER_SERDEV_TIMEOUT);
-		if (ret != req->len)
-			ret = ret < 0 ? ret : -EIO;
-		else
-			ret = 0;
-		goto out;
-	}
 
 	clen = req->len + NOISE_MAC_LEN;
 	if (clen + clen / 254 + 2 > sizeof(wire)) {
@@ -95,9 +84,9 @@ static void ash_tx_work_fn(struct work_struct *w)
 	}
 }
 
-/* Queue a message for transmission. Safe from atomic context. */
-static int ash_send_req(struct ashen_tamper *ash, const void *msg, size_t len,
-		bool raw)
+/* Queue a transport message. Safe from atomic context. */
+static int ash_send_envelope(struct ashen_tamper *ash,
+		const void *msg, size_t len)
 {
 	struct ashen_tx_req *slot;
 	unsigned long flags;
@@ -114,7 +103,6 @@ static int ash_send_req(struct ashen_tamper *ash, const void *msg, size_t len,
 	slot = &ash->tx_queue[ash->tx_head % ASHEN_TX_QUEUE_LEN];
 	memcpy(slot->payload, msg, len);
 	slot->len = len;
-	slot->raw = raw;
 	ash->tx_head++;
 out:
 	spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
@@ -122,12 +110,6 @@ out:
 	if (!ret)
 		queue_work(ash->tx_wq, &ash->tx_work);
 	return ret;
-}
-
-static int ash_send_envelope(struct ashen_tamper *ash,
-		const void *msg, size_t len)
-{
-	return ash_send_req(ash, msg, len, false);
 }
 
 static void ashen_continue_handshake(struct ashen_tamper *ash,
@@ -148,10 +130,13 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 	to_write = ret;
 
 	if (to_write) {
-		ret = ash_send_req(ash, hs_msg, to_write, true);
-		if (ret) {
-			pr_err("ashen-tamper: failed to queue handshake message: %zd\n",
-					ret);
+		ret = serdev_device_write(ash->serdev, hs_msg, to_write,
+				ASHEN_TAMPER_SERDEV_TIMEOUT);
+		if (ret != to_write) {
+			if (ret == -ETIMEDOUT || ret == -ERESTARTSYS)
+				pr_err("ashen-tamper: timeout during handshake\n");
+			else
+				pr_err("ashen-tamper: I/O error during handshake\n");
 			ash->conn_st = CONN_DISCONNECTED;
 			return;
 		}
