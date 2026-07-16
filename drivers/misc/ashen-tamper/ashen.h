@@ -46,7 +46,8 @@ struct ashen_tamper {
 	spinlock_t tx_queue_lock;
 	DECLARE_KFIFO(tx_queue, struct ashen_tx_req, ASHEN_TX_QUEUE_LEN);
 
-	struct mutex tx_lock; /* serialises noise send state + serdev write */
+	struct mutex tx_lock;
+	struct mutex rx_lock;
 	unsigned char tx_buf[256];
 };
 

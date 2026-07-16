@@ -27,7 +27,7 @@
 
 static void ashen_queue_restart(struct ashen_tamper *ash);
 
-static int ash_serdev_write(u8 *msg, size_t msg_len) {
+static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
 	if (msg_len == serdev_device_write(ash->serdev, msg, msg_len,
 			ASHEN_TAMPER_SERDEV_TIMEOUT)) {
 		return 0;
@@ -43,7 +43,6 @@ static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
 {
 	u8 wire[sizeof(ash->tx_buf)];
 	ssize_t encoded;
-	ssize_t written;
 	size_t clen = req->len + NOISE_MAC_LEN;
 
 	noise_encrypt_transport_message(&ash->noise_st, req->payload, req->len,
@@ -70,7 +69,7 @@ static void ash_tx_work_fn(struct work_struct *w)
 		if (!ok)
 			return;
 		
-		wait_for_completion(&ash->connection_ready);
+		wait_for_completion_killable(&ash->connection_ready);
 		mutex_lock(&ash->tx_lock);
 		if (ash_tx_one(ash, &req))
 			dev_err(&ash->serdev->dev, "I/O error during payload transmission\n");
@@ -131,12 +130,12 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 			return;
 		}
 	}
-	ash->conn_st = CONN_CONNECTED;
+	WRITE_ONCE(ash->conn_st, CONN_CONNECTED);
 	complete_all(&ash->connection_ready);
 
 	if (!done) {
 		hrtimer_start(&ash->restart_timer,
-				ms_to_ktime(ASHEN_TAMPER_HS_TIMEOUT_US),
+				us_to_ktime(ASHEN_TAMPER_HS_TIMEOUT_US),
 				HRTIMER_MODE_REL_SOFT);
 		mutex_unlock(&ash->tx_lock);
 		return;
@@ -157,14 +156,13 @@ static void ashen_restart_handshake(struct work_struct *w)
 	struct ashen_tamper *ash = container_of(w, struct ashen_tamper, restart_work);
 	static const u8 reset[ASHEN_TAMPER_RESET_LEN] = {0};
 	unsigned long flags;
-	ssize_t written;
-
-	ash->conn_st = CONN_DISCONNECTED;
+	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+	mutex_lock(&ash->rx_lock);
+	mutex_lock(&ash->tx_lock);
 	if (hrtimer_active(&ash->refresh_timer)) {
 		ash->autostart = true;
 		hrtimer_cancel(&ash->refresh_timer);
 	}
-	mutex_lock(&ash->tx_lock);
 	reinit_completion(&ash->connection_ready);
 
 	spin_lock_irqsave(&ash->tx_queue_lock, flags);
@@ -175,18 +173,25 @@ static void ashen_restart_handshake(struct work_struct *w)
 
 	noise_init(&ash->noise_st, true);
 	if (!noise_keypair_generate(&ash->noise_st.hs.loc_static)) {
+		mutex_unlock(&ash->rx_lock);
 		mutex_unlock(&ash->tx_lock);
 		dev_err_ratelimited(&ash->serdev->dev,
-				"unable to generate static keypair\n");
+				"unable to generate static keypair. giving up.\n");
 		return;
 	}
 
-	ash_serdev_write(ash->serdev, reset, sizeof(reset));
+	if (ash_serdev_write(ash, reset, sizeof(reset))) {
+		mutex_unlock(&ash->rx_lock);
+		mutex_unlock(&ash->tx_lock);
+		ashen_queue_restart(ash);
+		return;
+	}
 	ash->framer->len = 0;
 	ash->framer->sync = false;
-	ash->conn_st = CONN_HANDSHAKE;
+	WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
 	mutex_unlock(&ash->tx_lock);
 	ashen_continue_handshake(ash, NULL, 0);
+	mutex_unlock(&ash->rx_lock);
 }
 
 static void ashen_handle_packet(struct ashen_tamper *ash,
@@ -254,9 +259,9 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 			goto malformed;
 		
 		dev_warn(&ash->serdev->dev, "device asked to disconnect, disarming heartbeat\n");
+		WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
 		hrtimer_cancel(&ash->refresh_timer);
 		hrtimer_cancel(&ash->hb_timer);
-		ash->conn_st = CONN_DISCONNECTED;
 		reinit_completion(&ash->connection_ready);
 		break;
 	default:
@@ -284,19 +289,24 @@ static void ashen_receive_packet(void *ctx,
 				"received out-of-order message from device\n");
 		break;
 	case CONN_HANDSHAKE:
+		mutex_lock(&ash->rx_lock);
 		ashen_continue_handshake(ash, buf, len);
+		mutex_unlock(&ash->rx_lock);
 		break;
 	case CONN_CONNECTED:
 		if (len < NOISE_MAC_LEN)
 			break;
+
+		mutex_lock(&ash->rx_lock);
 		if (!noise_decrypt_transport_message(&ash->noise_st,
 					frame, len, frame)) {
 			dev_warn_ratelimited(&ash->serdev->dev,
 					"transport decrypt failed, restarting\n");
 			ashen_queue_restart(ash);
+			mutex_unlock(&ash->rx_lock);
 			break;
 		}
-
+		mutex_unlock(&ash->rx_lock);
 		ashen_handle_packet(ash, frame, len - NOISE_MAC_LEN);
 		break;
 	}
@@ -353,7 +363,7 @@ ash_refresh_timer_fn(struct hrtimer *t)
 		dev_warn_ratelimited(&ash->serdev->dev,
 				"failed to queue echo request\n");
 
-	if (!hrtimer_active(&ash->hb_timer))
+	if (!hrtimer_active(&ash->hb_timer) && ash->conn_st == CONN_CONNECTED)
 		hrtimer_start(&ash->hb_timer, ash->timeout,
 				HRTIMER_MODE_REL_HARD);
 	hrtimer_forward_now(t, ash->refresh_ivl);
@@ -473,10 +483,11 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	of_property_read_u32(serdev->dev.of_node, "refresh-ivl-us", &val);
 	ash->refresh_ivl = us_to_ktime(val);
 
-	ash->conn_st = CONN_DISCONNECTED;
+	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
 	init_completion(&ash->connection_ready);
 	init_completion(&ash->packet_ready);
 	mutex_init(&ash->tx_lock);
+	mutex_init(&ash->rx_lock);
 
 	spin_lock_init(&ash->tx_queue_lock);
 	INIT_KFIFO(ash->tx_queue);
@@ -516,17 +527,13 @@ error:
 static void ashen_tamper_remove(struct serdev_device *serdev)
 {
 	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
+	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
 
-	/* Timers first: both can queue work. Then the work itself, or a restart
-	 * could run against a closed serdev. */
 	hrtimer_cancel(&ash->restart_timer);
 	hrtimer_cancel(&ash->refresh_timer);
 	hrtimer_cancel(&ash->hb_timer);
-
-	ash->conn_st = CONN_DISCONNECTED;
 	cancel_work_sync(&ash->restart_work);
 	cancel_work_sync(&ash->tx_work);
-
 	serdev_device_close(serdev);
 	destroy_workqueue(ash->tx_wq);
 }
