@@ -29,6 +29,7 @@ struct ashen_tx_req {
 struct ashen_tamper {
 	struct hrtimer hb_timer;
 	struct hrtimer refresh_timer;
+	struct hrtimer restart_timer;
 	struct serdev_device *serdev;
 	struct noise_state noise_st;
 	enum ashen_connstate conn_st;
@@ -40,6 +41,7 @@ struct ashen_tamper {
 	struct ashen_framer *framer;
 
 	struct work_struct tx_work;
+	struct work_struct restart_work;
 	struct workqueue_struct *tx_wq;
 	spinlock_t tx_queue_lock;
 	DECLARE_KFIFO(tx_queue, struct ashen_tx_req, ASHEN_TX_QUEUE_LEN);

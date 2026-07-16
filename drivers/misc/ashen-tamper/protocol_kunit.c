@@ -355,6 +355,63 @@ static void test_framer_truncated(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cap->count, 0); /* dropped, no frame delivered */
 }
 
+/* The device answers our 32-null reset with >= 8 nulls of its own. Pushing that
+ * run must not deliver bogus frames, and must leave the framer aligned for the
+ * device's first real frame -- even with garbage buffered from the dead session. */
+static void test_framer_resync_on_null_run(struct kunit *test)
+{
+	struct captured *cap = kunit_kzalloc(test, sizeof(*cap), GFP_KERNEL);
+	struct ashen_framer *f;
+	u8 garbage[] = { 9, 0xAA, 0xBB }; /* partial frame, no delimiter */
+	u8 nulls[8] = {0};
+	u8 payload[] = { 1, 2, 3, 0, 4 };
+	u8 wire[32];
+	size_t wlen;
+
+	KUNIT_ASSERT_NOT_NULL(test, cap);
+	cap->test = test;
+	f = make_framer(test, cap);
+
+	ashen_framer_push(f, garbage, sizeof(garbage));
+	ashen_framer_push(f, nulls, sizeof(nulls));
+
+	/* the truncated garbage is dropped, and the null run itself is not a frame */
+	KUNIT_EXPECT_EQ(test, cap->count, 0);
+	KUNIT_EXPECT_EQ(test, f->len, (size_t)0);
+
+	wlen = make_wire(test, payload, sizeof(payload), wire, sizeof(wire));
+	ashen_framer_push(f, wire, wlen);
+
+	KUNIT_ASSERT_EQ(test, cap->count, 1);
+	KUNIT_EXPECT_EQ(test, cap->len[0], sizeof(payload));
+	KUNIT_EXPECT_MEMEQ(test, cap->data[0], payload, sizeof(payload));
+}
+
+/* A restart re-runs noise_init() + keygen on an already-keyed state. Getting the
+ * order wrong trips BUG_ON(kp->has_key) in noise_keypair_generate() and takes the
+ * kernel down, so pin the sequence the driver's restart path uses. */
+static void test_handshake_restart_rekeys(struct kunit *test)
+{
+	struct noise_state *ini = kunit_kzalloc(test, sizeof(*ini), GFP_KERNEL);
+	struct noise_state *resp = kunit_kzalloc(test, sizeof(*resp), GFP_KERNEL);
+	u8 first_static[NOISE_PUBLIC_KEY_LEN];
+
+	KUNIT_ASSERT_NOT_NULL(test, ini);
+	KUNIT_ASSERT_NOT_NULL(test, resp);
+
+	do_handshake(test, ini, resp);
+	memcpy(first_static, ini->hs.loc_static.public, sizeof(first_static));
+
+	/* Restart on the same, already-keyed states. */
+	do_handshake(test, ini, resp);
+
+	KUNIT_EXPECT_TRUE(test, ini->send.cs.has_key);
+	KUNIT_EXPECT_TRUE(test, resp->recv.cs.has_key);
+	/* fresh static keypair per handshake is intentional here */
+	KUNIT_EXPECT_MEMNEQ(test, ini->hs.loc_static.public, first_static,
+			sizeof(first_static));
+}
+
 /* ---- end to end ---- */
 
 static void test_e2e_two_instances(struct kunit *test)
@@ -428,10 +485,12 @@ static struct kunit_case ashen_protocol_test_cases[] = {
 	KUNIT_CASE(test_transport_roundtrip),
 	KUNIT_CASE(test_transport_tamper),
 	KUNIT_CASE(test_handshake_rejects_bad_msg),
+	KUNIT_CASE(test_handshake_restart_rekeys),
 	KUNIT_CASE(test_framer_single_frame),
 	KUNIT_CASE(test_framer_chunked),
 	KUNIT_CASE(test_framer_overrun),
 	KUNIT_CASE(test_framer_truncated),
+	KUNIT_CASE(test_framer_resync_on_null_run),
 	KUNIT_CASE(test_e2e_two_instances),
 	{},
 };
