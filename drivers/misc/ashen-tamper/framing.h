@@ -9,10 +9,12 @@
 
 #include <linux/types.h>
 
+#define FRAMER_SYNC_NULLS 8
+
 struct ashen_framer {
 	size_t cap;	/* usable size of buf[] */
 	size_t len;
-	bool sync;
+	int sync;
 	void (*on_frame)(void *ctx, const u8 *frame, size_t len);
 	void *ctx;
 	u8 buf[];	/* flexible array member, must stay last */

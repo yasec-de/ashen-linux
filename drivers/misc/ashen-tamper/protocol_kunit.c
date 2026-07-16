@@ -258,6 +258,13 @@ static struct ashen_framer *make_framer(struct kunit *test, struct captured *cap
 	return f;
 }
 
+static void sync_framer(struct ashen_framer *f)
+{
+	u8 nulls[FRAMER_SYNC_NULLS] = {0};
+
+	ashen_framer_push(f, nulls, sizeof(nulls));
+}
+
 /* COBS-encode payload into wire (delimiter-terminated), return wire length. */
 static size_t make_wire(struct kunit *test, const u8 *payload, size_t plen,
 		u8 *wire, size_t wire_cap)
@@ -279,6 +286,7 @@ static void test_framer_single_frame(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, cap);
 	cap->test = test;
 	f = make_framer(test, cap);
+	sync_framer(f);
 	wlen = make_wire(test, payload, sizeof(payload), wire, sizeof(wire));
 
 	KUNIT_EXPECT_EQ(test, ashen_framer_push(f, wire, wlen), wlen);
@@ -299,6 +307,7 @@ static void test_framer_chunked(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, cap);
 	cap->test = test;
 	f = make_framer(test, cap);
+	sync_framer(f);
 
 	/* two frames back to back in one buffer */
 	w1 = make_wire(test, p1, sizeof(p1), wire, sizeof(wire));
@@ -328,12 +337,16 @@ static void test_framer_overrun(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, cap);
 	cap->test = test;
 	f = make_framer(test, cap);
+	sync_framer(f);
 
+	/* junk with no delimiter fills the buffer past cap: overrun drops it
+	 * and knocks the framer back out of sync */
 	memset(junk, 0xFF, sizeof(junk));
 	ashen_framer_push(f, junk, sizeof(junk));
 	KUNIT_EXPECT_EQ(test, cap->count, 0);
 	KUNIT_EXPECT_FALSE(test, f->sync);
 
+	sync_framer(f);
 	wlen = make_wire(test, payload, sizeof(payload), wire, sizeof(wire));
 	ashen_framer_push(f, wire, wlen);
 	KUNIT_ASSERT_EQ(test, cap->count, 1);
@@ -350,6 +363,7 @@ static void test_framer_truncated(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, cap);
 	cap->test = test;
 	f = make_framer(test, cap);
+	sync_framer(f);
 
 	ashen_framer_push(f, wire, sizeof(wire));
 	KUNIT_EXPECT_EQ(test, cap->count, 0); /* dropped, no frame delivered */
@@ -433,6 +447,8 @@ static void test_e2e_two_instances(struct kunit *test)
 	cap_i->test = test;
 	f_resp = make_framer(test, cap_r); /* receives on the responder side */
 	f_ini = make_framer(test, cap_i);  /* receives on the initiator side */
+	sync_framer(f_resp);
+	sync_framer(f_ini);
 
 	do_handshake(test, ini, resp);
 

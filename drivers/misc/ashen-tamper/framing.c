@@ -9,8 +9,6 @@
 #include "cobs.h"
 #include "framing.h"
 
-#define FRAMER_SYNC_NULLS 8
-
 static size_t ashen_framer_chunk(struct ashen_framer *f,
 		const u8 *buf, size_t size)
 {
@@ -18,8 +16,17 @@ static size_t ashen_framer_chunk(struct ashen_framer *f,
 	size_t null_pos = strnlen(buf, size);
 	bool found_null = null_pos < size;
 
+	if (f->sync < FRAMER_SYNC_NULLS) {
+		if (null_pos) {
+			f->sync = 0;
+			return null_pos;
+		}
+		f->sync++;
+		return 1;
+	}
+
 	if (f->len + null_pos > f->cap) {
-		f->sync = false;
+		f->sync = 0;
 		f->len = 0;
 		pr_warn("ashen-tamper: receive buffer overrun\n");
 		/* drop this chunk; also skip the delimiter if we saw one */
@@ -32,17 +39,6 @@ static size_t ashen_framer_chunk(struct ashen_framer *f,
 	if (!found_null)
 		return size;
 
-	if (f->sync < FRAMER_SYNC_NULLS) {
-		if (f->len != 1) {
-			f->sync = 0;
-		} else {
-			f->sync ++;
-		}
-		f->len = 0;
-		return null_pos + 1;
-	}
-
-	/* frame complete. decode in place. */
 	len = cobs_decode(f->buf, f->len, f->buf, f->cap);
 	if (len >= 0) {
 		f->on_frame(f->ctx, f->buf, len);
