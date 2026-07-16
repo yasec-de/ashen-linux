@@ -41,7 +41,7 @@ static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
 
 static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
 {
-	u8 wire[sizeof(ash->tx_buf)];
+	u8 wire[sizeof(ash->tx_buf) + 16];
 	ssize_t encoded;
 	size_t clen = req->len + NOISE_MAC_LEN;
 
@@ -110,7 +110,6 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 		const u8 *buf, size_t len)
 {
 	u8 hs_msg[NOISE_MAX_HS_MSG_LEN];
-	ssize_t ret;
 	ssize_t to_write;
 	bool done = false;
 	u8 type;
@@ -187,7 +186,7 @@ static void ashen_restart_handshake(struct work_struct *w)
 		return;
 	}
 	ash->framer->len = 0;
-	ash->framer->sync = false;
+	ash->framer->sync = 0;
 	WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
 	mutex_unlock(&ash->tx_lock);
 	ashen_continue_handshake(ash, NULL, 0);
@@ -269,8 +268,6 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 				buf[0]);
 		break;
 	}
-
-	complete(&ash->packet_ready);
 	return;
 
 malformed:
@@ -283,13 +280,14 @@ static void ashen_receive_packet(void *ctx,
 	struct ashen_tamper *ash = (struct ashen_tamper *)ctx;
 	u8 *frame = (u8 *)buf; /* framer buffer, in-place decrypt is fine */
 
-	switch (ash->conn_st) {
+	mutex_lock(&ash->rx_lock);
+	switch (READ_ONCE(ash->conn_st)) {
 	case CONN_DISCONNECTED:
 		dev_warn(&ash->serdev->dev,
 				"received out-of-order message from device\n");
+		mutex_unlock(&ash->rx_lock);
 		break;
 	case CONN_HANDSHAKE:
-		mutex_lock(&ash->rx_lock);
 		ashen_continue_handshake(ash, buf, len);
 		mutex_unlock(&ash->rx_lock);
 		break;
@@ -297,7 +295,6 @@ static void ashen_receive_packet(void *ctx,
 		if (len < NOISE_MAC_LEN)
 			break;
 
-		mutex_lock(&ash->rx_lock);
 		if (!noise_decrypt_transport_message(&ash->noise_st,
 					frame, len, frame)) {
 			dev_warn_ratelimited(&ash->serdev->dev,
@@ -363,7 +360,7 @@ ash_refresh_timer_fn(struct hrtimer *t)
 		dev_warn_ratelimited(&ash->serdev->dev,
 				"failed to queue echo request\n");
 
-	if (!hrtimer_active(&ash->hb_timer) && ash->conn_st == CONN_CONNECTED)
+	if (!hrtimer_active(&ash->hb_timer) && READ_ONCE(ash->conn_st) == CONN_CONNECTED)
 		hrtimer_start(&ash->hb_timer, ash->timeout,
 				HRTIMER_MODE_REL_HARD);
 	hrtimer_forward_now(t, ash->refresh_ivl);
@@ -485,7 +482,6 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 
 	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
 	init_completion(&ash->connection_ready);
-	init_completion(&ash->packet_ready);
 	mutex_init(&ash->tx_lock);
 	mutex_init(&ash->rx_lock);
 

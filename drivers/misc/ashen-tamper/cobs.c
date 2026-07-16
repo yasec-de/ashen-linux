@@ -49,7 +49,7 @@ ssize_t cobs_encode(const u8 *input, size_t input_len, u8 *output, size_t output
 	return out_pos + 1;
 }
 
-/* input and output may overlap. */
+/* input and output may overlap. input must be free of null bytes. */
 ssize_t cobs_decode(const u8 *input, size_t input_len, u8 *output, size_t output_len)
 {
 	size_t out_pos = 0;
@@ -65,12 +65,16 @@ ssize_t cobs_decode(const u8 *input, size_t input_len, u8 *output, size_t output
 		for (size_t i=0; i<len-1; i++) {
 			if (in_pos >= input_len)
 				return -EINTR;
+			if (out_pos >= output_len)
+				return -EINVAL;
 			output[out_pos] = input[in_pos];
 			in_pos += 1;
 			out_pos += 1;
 		}
 
 		if (in_pos < input_len && len < 255) {
+			if (out_pos >= output_len)
+				return -EINVAL;
 			output[out_pos] = 0;
 			out_pos += 1;
 		}

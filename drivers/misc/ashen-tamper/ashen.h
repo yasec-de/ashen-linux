@@ -34,7 +34,6 @@ struct ashen_tamper {
 	struct noise_state noise_st;
 	enum ashen_connstate conn_st;
 	struct completion connection_ready;
-	struct completion packet_ready;
 	ktime_t refresh_ivl;
 	ktime_t timeout;
 	bool autostart;
