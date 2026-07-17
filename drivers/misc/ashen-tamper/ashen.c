@@ -69,8 +69,17 @@ static void ash_tx_work_fn(struct work_struct *w)
 		
 		wait_for_completion_killable(&ash->connection_ready);
 		mutex_lock(&ash->tx_lock);
-		if (ash_tx_one(ash, &req))
+		if (ash_tx_one(ash, &req)) {
 			dev_err(&ash->serdev->dev, "I/O error during payload transmission\n");
+		} else if (req.len == sizeof(struct ashen_msg_echo) &&
+			   req.payload[0] == ASHEN_MSG_ECHO_REQUEST &&
+			   !hrtimer_active(&ash->hb_timer)) {
+			/* Start the first response deadline only once the request has
+			 * actually reached serdev.  Starting it when the hrtimer merely
+			 * queues this work can panic during early-boot workqueue delays. */
+			hrtimer_start(&ash->hb_timer, ash->timeout,
+					HRTIMER_MODE_REL_HARD);
+		}
 		mutex_unlock(&ash->tx_lock);
 	}
 }
@@ -362,9 +371,6 @@ ash_refresh_timer_fn(struct hrtimer *t)
 		dev_warn_ratelimited(&ash->serdev->dev,
 				"failed to queue echo request\n");
 
-	if (!hrtimer_active(&ash->hb_timer) && READ_ONCE(ash->conn_st) == CONN_CONNECTED)
-		hrtimer_start(&ash->hb_timer, ash->timeout,
-				HRTIMER_MODE_REL_HARD);
 	hrtimer_forward_now(t, ash->refresh_ivl);
 	return HRTIMER_RESTART;
 }
