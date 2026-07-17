@@ -16,19 +16,19 @@
  * -> s, se			message "c"
  */
 
-/* Hashed as-is per Noise; sizes exclude the terminating NUL so no zero padding
- * leaks into the transcript. The device firmware must hash the identical bytes. */
-static const u8 handshake_name[33] __nonstring = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
-static const u8 identifier_name[27] __nonstring = "Ashen v1 jaseg jan@yasec.de";
+/* The protocol name is exactly one SHA-256 digest wide and excludes the
+ * terminating NUL, as required by the Noise initialization rules. */
+static const u8 handshake_name[NOISE_HASH_LEN] __nonstring =
+	"Noise_XX_25519_ChaChaPoly_SHA256";
 
 static void mix_hash(struct noise_handshake_state *st, const u8 *src, size_t src_len)
 {
-	struct blake2s_ctx blake;
+	struct sha256_ctx sha;
 
-	blake2s_init(&blake, NOISE_HASH_LEN);
-	blake2s_update(&blake, st->ss.hash, NOISE_HASH_LEN);
-	blake2s_update(&blake, src, src_len);
-	blake2s_final(&blake, st->ss.hash);
+	sha256_init(&sha);
+	sha256_update(&sha, st->ss.hash, NOISE_HASH_LEN);
+	sha256_update(&sha, src, src_len);
+	sha256_final(&sha, st->ss.hash);
 }
 
 void noise_init(struct noise_state *st, bool i_am_the_initiator)
@@ -36,10 +36,14 @@ void noise_init(struct noise_state *st, bool i_am_the_initiator)
 	memzero_explicit(st, sizeof(*st));
 	st->hs.i_am_the_initiator = i_am_the_initiator;
 
-	blake2s(NULL, 0, handshake_name, sizeof(handshake_name),
-		st->hs.ss.chaining_key, NOISE_HASH_LEN);
+	/* The protocol name is exactly HASHLEN bytes, so Noise initializes h and
+	 * ck to the name itself rather than hashing or padding it. */
+	memcpy(st->hs.ss.chaining_key, handshake_name, sizeof(handshake_name));
 	memcpy(st->hs.ss.hash, st->hs.ss.chaining_key, NOISE_HASH_LEN);
-	mix_hash(&st->hs, identifier_name, sizeof(identifier_name));
+	/* Both firmware and host use the default empty prologue. Noise still
+	 * applies MixHash(prologue) when it is empty; skipping this produces the
+	 * same cipher keys but different handshake authentication tags. */
+	mix_hash(&st->hs, NULL, 0);
 }
 
 bool noise_keypair_generate(struct noise_keypair *kp)
@@ -57,26 +61,26 @@ bool noise_keypair_generate(struct noise_keypair *kp)
 static void hmac(u8 out[static NOISE_HASH_LEN], const u8 *in, size_t inlen,
 		const u8 key[static NOISE_HASH_LEN])
 {
-	struct blake2s_ctx blake;
-	u8 x_key[BLAKE2S_BLOCK_SIZE] __aligned(__alignof__(u32)) = {0};
+	struct sha256_ctx sha;
+	u8 x_key[SHA256_BLOCK_SIZE] __aligned(__alignof__(u32)) = {0};
 	int i;
 
 	memcpy(x_key, key, NOISE_HASH_LEN);
-	for (i = 0; i < BLAKE2S_BLOCK_SIZE; ++i)
+	for (i = 0; i < SHA256_BLOCK_SIZE; ++i)
 		x_key[i] ^= 0x36;
 
-	blake2s_init(&blake, BLAKE2S_HASH_SIZE);
-	blake2s_update(&blake, x_key, BLAKE2S_BLOCK_SIZE);
-	blake2s_update(&blake, in, inlen);
-	blake2s_final(&blake, out);
+	sha256_init(&sha);
+	sha256_update(&sha, x_key, SHA256_BLOCK_SIZE);
+	sha256_update(&sha, in, inlen);
+	sha256_final(&sha, out);
 
-	for (i = 0; i < BLAKE2S_BLOCK_SIZE; ++i)
+	for (i = 0; i < SHA256_BLOCK_SIZE; ++i)
 		x_key[i] ^= 0x5c ^ 0x36; /* remove ipad, add opad */
 
-	blake2s_init(&blake, BLAKE2S_HASH_SIZE);
-	blake2s_update(&blake, x_key, BLAKE2S_BLOCK_SIZE);
-	blake2s_update(&blake, out, NOISE_HASH_LEN);
-	blake2s_final(&blake, out);
+	sha256_init(&sha);
+	sha256_update(&sha, x_key, SHA256_BLOCK_SIZE);
+	sha256_update(&sha, out, NOISE_HASH_LEN);
+	sha256_final(&sha, out);
 
 	memzero_explicit(x_key, sizeof(x_key));
 }
@@ -159,7 +163,8 @@ static bool __must_check mix_key_dh(struct noise_handshake_state *st,
 static void encrypt_and_hash(struct noise_handshake_state *st, u8 *data, size_t plain_len)
 {
 	chacha20poly1305_encrypt(data, data, plain_len, st->ss.hash, NOISE_HASH_LEN,
-			0 /* nonce is zero during the handshake */, st->ss.cs.key);
+			st->ss.cs.counter, st->ss.cs.key);
+	st->ss.cs.counter++;
 	mix_hash(st, data, plain_len + NOISE_MAC_LEN);
 }
 
@@ -167,8 +172,9 @@ static bool __must_check decrypt_and_hash(struct noise_handshake_state *st,
 		u8 *out, const u8 *in, size_t cipher_len)
 {
 	if (!chacha20poly1305_decrypt(out, in, cipher_len, st->ss.hash, NOISE_HASH_LEN,
-			0 /* nonce is zero during the handshake */, st->ss.cs.key))
+			st->ss.cs.counter, st->ss.cs.key))
 		return false;
+	st->ss.cs.counter++;
 	mix_hash(st, in, cipher_len);
 	return true;
 }
@@ -199,7 +205,7 @@ bool noise_handshake_read_msg_a(struct noise_handshake_state *st,
 }
 
 ssize_t noise_handshake_write_msg_b(struct noise_handshake_state *st,
-		u8 out[static 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN])
+		u8 out[static 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN])
 {
 	BUG_ON(!st->rem_ephem.has_key);
 	BUG_ON(!st->loc_static.has_key);
@@ -222,12 +228,17 @@ ssize_t noise_handshake_write_msg_b(struct noise_handshake_state *st,
 	/* es */
 	if (!mix_key_dh(st, &st->loc_static, &st->rem_ephem))
 		return -EINVAL;
-	return 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN;
+
+	/* payload: even an empty payload emits an authentication tag once the
+	 * handshake has a cipher key. */
+	encrypt_and_hash(st, out + 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN, 0);
+	return 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN;
 }
 
 bool noise_handshake_read_msg_b(struct noise_handshake_state *st,
-		const u8 in[static 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN])
+		const u8 in[static 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN])
 {
+	u8 empty;
 	/* e */
 	memcpy(st->rem_ephem.public, in, NOISE_PUBLIC_KEY_LEN);
 	st->rem_ephem.has_key = true;
@@ -246,11 +257,17 @@ bool noise_handshake_read_msg_b(struct noise_handshake_state *st,
 	/* es */
 	if (!mix_key_dh(st, &st->loc_ephem, &st->rem_static))
 		return false;
+
+	/* payload */
+	if (!decrypt_and_hash(st, &empty,
+			in + 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN,
+			NOISE_MAC_LEN))
+		return false;
 	return true;
 }
 
 ssize_t noise_handshake_write_msg_c(struct noise_handshake_state *st,
-		u8 out[static NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN])
+		u8 out[static NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN])
 {
 	BUG_ON(!st->loc_static.has_key);
 	BUG_ON(!st->rem_ephem.has_key);
@@ -262,12 +279,16 @@ ssize_t noise_handshake_write_msg_c(struct noise_handshake_state *st,
 	/* se */
 	if (!mix_key_dh(st, &st->loc_static, &st->rem_ephem))
 		return -EINVAL;
-	return NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN;
+
+	/* payload */
+	encrypt_and_hash(st, out + NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN, 0);
+	return NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN;
 }
 
 bool noise_handshake_read_msg_c(struct noise_handshake_state *st,
-		const u8 in[static NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN])
+		const u8 in[static NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN])
 {
+	u8 empty;
 	/* s */
 	if (!decrypt_and_hash(st, st->rem_static.public, in,
 			NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN))
@@ -276,6 +297,12 @@ bool noise_handshake_read_msg_c(struct noise_handshake_state *st,
 
 	/* se */
 	if (!mix_key_dh(st, &st->loc_ephem, &st->rem_static))
+		return false;
+
+	/* payload */
+	if (!decrypt_and_hash(st, &empty,
+			in + NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN,
+			NOISE_MAC_LEN))
 		return false;
 	return true;
 }
@@ -297,16 +324,6 @@ static void noise_handshake_split(struct noise_state *st)
 	memzero_explicit(&st->hs.rem_ephem, sizeof(st->hs.rem_ephem));
 }
 
-static void rekey(struct noise_cipher_state *cs)
-{
-	u8 ciphertext[NOISE_SYMMETRIC_KEY_LEN + NOISE_MAC_LEN];
-	u8 zeros[32] = {0};
-
-	chacha20poly1305_encrypt(ciphertext, zeros, sizeof(zeros), NULL, 0,
-			U64_MAX, cs->key);
-	memcpy(cs->key, ciphertext, NOISE_SYMMETRIC_KEY_LEN);
-}
-
 bool noise_decrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len, u8 *out)
 {
@@ -315,7 +332,6 @@ bool noise_decrypt_transport_message(struct noise_state *st,
 				st->recv.cs.counter, st->recv.cs.key))
 		return false;
 	st->recv.cs.counter ++;
-	rekey(&st->recv.cs);
 	return true;
 }
 
@@ -326,7 +342,6 @@ void noise_encrypt_transport_message(struct noise_state *st,
 	chacha20poly1305_encrypt(out, in, in_len, NULL, 0,
 			st->send.cs.counter, st->send.cs.key);
 	st->send.cs.counter ++;
-	rekey(&st->send.cs);
 }
 
 static ssize_t noise_handshake_initiator(struct noise_state *st,
@@ -339,7 +354,7 @@ static ssize_t noise_handshake_initiator(struct noise_state *st,
 		case 0:
 			return noise_handshake_write_msg_a(&st->hs, out);
 		case 1:
-			if (in_len != 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN)
+			if (in_len != 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN)
 				return -EINVAL;
 			if (!noise_handshake_read_msg_b(&st->hs, in))
 				return -EBADMSG;
@@ -367,7 +382,7 @@ static ssize_t noise_handshake_responder(struct noise_state *st,
 			return -EBADMSG;
 		return noise_handshake_write_msg_b(&st->hs, out);
 	case 1:
-		if (in_len != NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN)
+		if (in_len != NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN)
 			return -EINVAL;
 		if (!noise_handshake_read_msg_c(&st->hs, in))
 			return -EBADMSG;

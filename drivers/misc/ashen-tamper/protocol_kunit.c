@@ -111,17 +111,19 @@ static void do_handshake(struct kunit *test, struct noise_state *ini,
 
 	/* -> e (msg a), initiator writes, ignores input */
 	la = noise_handshake(ini, NULL, 0, msg_a, &done);
-	KUNIT_ASSERT_GT(test, la, 0);
+	KUNIT_ASSERT_EQ(test, la, (ssize_t)NOISE_PUBLIC_KEY_LEN);
 	KUNIT_ASSERT_FALSE(test, done);
 
 	/* responder reads a, writes b */
 	lb = noise_handshake(resp, msg_a, la, msg_b, &done);
-	KUNIT_ASSERT_GT(test, lb, 0);
+	KUNIT_ASSERT_EQ(test, lb, (ssize_t)(2 * NOISE_PUBLIC_KEY_LEN +
+			2 * NOISE_MAC_LEN));
 	KUNIT_ASSERT_FALSE(test, done);
 
 	/* initiator reads b, writes c, and is done */
 	lc = noise_handshake(ini, msg_b, lb, msg_c, &done);
-	KUNIT_ASSERT_GT(test, lc, 0);
+	KUNIT_ASSERT_EQ(test, lc, (ssize_t)(NOISE_PUBLIC_KEY_LEN +
+			2 * NOISE_MAC_LEN));
 	KUNIT_ASSERT_TRUE(test, done);
 
 	/* responder reads c, is done, no reply */
@@ -146,16 +148,40 @@ static void test_handshake_completes(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, resp->recv.cs.has_key);
 }
 
+static void test_noise_sha256_protocol_initialization(struct kunit *test)
+{
+	static const u8 protocol_name[NOISE_HASH_LEN] =
+		"Noise_XX_25519_ChaChaPoly_SHA256";
+	static const u8 empty_prologue_hash[NOISE_HASH_LEN] = {
+		0xf3, 0xd1, 0x5e, 0x61, 0x08, 0xed, 0x95, 0x56,
+		0x17, 0x12, 0x07, 0xba, 0xa5, 0x8f, 0x97, 0xd2,
+		0x9a, 0x13, 0xc6, 0xbe, 0x40, 0x59, 0x51, 0x66,
+		0x06, 0x6e, 0x2e, 0x09, 0x58, 0xdc, 0x00, 0x2d,
+	};
+	struct noise_state *st = kunit_kzalloc(test, sizeof(*st), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, st);
+	noise_init(st, true);
+	KUNIT_EXPECT_MEMEQ(test, st->hs.ss.hash, empty_prologue_hash,
+			sizeof(empty_prologue_hash));
+	KUNIT_EXPECT_MEMEQ(test, st->hs.ss.chaining_key, protocol_name,
+			sizeof(protocol_name));
+}
+
 static void test_transport_roundtrip(struct kunit *test)
 {
 	struct noise_state *ini = kunit_kzalloc(test, sizeof(*ini), GFP_KERNEL);
 	struct noise_state *resp = kunit_kzalloc(test, sizeof(*resp), GFP_KERNEL);
 	u8 pt[32], ct[32 + NOISE_MAC_LEN], out[32];
+	u8 ini_send_key[NOISE_SYMMETRIC_KEY_LEN];
+	u8 resp_send_key[NOISE_SYMMETRIC_KEY_LEN];
 	int i;
 
 	KUNIT_ASSERT_NOT_NULL(test, ini);
 	KUNIT_ASSERT_NOT_NULL(test, resp);
 	do_handshake(test, ini, resp);
+	memcpy(ini_send_key, ini->send.cs.key, sizeof(ini_send_key));
+	memcpy(resp_send_key, resp->send.cs.key, sizeof(resp_send_key));
 
 	for (i = 0; i < 4; i++) {
 		memset(pt, 0xA0 + i, sizeof(pt));
@@ -173,6 +199,13 @@ static void test_transport_roundtrip(struct kunit *test)
 			noise_decrypt_transport_message(ini, ct, sizeof(ct), out));
 		KUNIT_EXPECT_MEMEQ(test, out, pt, sizeof(pt));
 	}
+
+	/* Standard Noise transport increments nonces; it does not implicitly
+	 * rekey after every message. */
+	KUNIT_EXPECT_MEMEQ(test, ini->send.cs.key, ini_send_key,
+			sizeof(ini_send_key));
+	KUNIT_EXPECT_MEMEQ(test, resp->send.cs.key, resp_send_key,
+			sizeof(resp_send_key));
 }
 
 static void test_transport_tamper(struct kunit *test)
@@ -498,6 +531,7 @@ static struct kunit_case ashen_protocol_test_cases[] = {
 	KUNIT_CASE(test_cobs_decode_errors),
 	KUNIT_CASE(test_cobs_encode_overflow),
 	KUNIT_CASE(test_handshake_completes),
+	KUNIT_CASE(test_noise_sha256_protocol_initialization),
 	KUNIT_CASE(test_transport_roundtrip),
 	KUNIT_CASE(test_transport_tamper),
 	KUNIT_CASE(test_handshake_rejects_bad_msg),

@@ -23,7 +23,7 @@
 #define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
 #define ASHEN_TAMPER_RX_BUF_SIZE 256
 #define ASHEN_TAMPER_HS_TIMEOUT_US 250000
-#define ASHEN_TAMPER_RESET_LEN 32
+#define ASHEN_TAMPER_RESET_LEN 8
 
 static void ashen_queue_restart(struct ashen_tamper *ash);
 
@@ -32,7 +32,6 @@ static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
 			ASHEN_TAMPER_SERDEV_TIMEOUT)) {
 		return 0;
 	}
-
 	dev_err_ratelimited(&ash->serdev->dev,
 			"I/O error writing to serial\n");
 	ashen_queue_restart(ash);
@@ -44,7 +43,6 @@ static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
 	u8 wire[sizeof(ash->tx_buf) + 16];
 	ssize_t encoded;
 	size_t clen = req->len + NOISE_MAC_LEN;
-
 	noise_encrypt_transport_message(&ash->noise_st, req->payload, req->len,
 			ash->tx_buf);
 	encoded = cobs_encode(ash->tx_buf, clen, wire, sizeof(wire));
@@ -110,7 +108,9 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 		const u8 *buf, size_t len)
 {
 	u8 hs_msg[NOISE_MAX_HS_MSG_LEN];
+	u8 wire[NOISE_MAX_HS_MSG_LEN + 2];
 	ssize_t to_write;
+	ssize_t encoded;
 	bool done = false;
 	u8 type;
 	hrtimer_cancel(&ash->restart_timer);
@@ -124,13 +124,12 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 
 	mutex_lock(&ash->tx_lock);
 	if (to_write) {
-		if (ash_serdev_write(ash, hs_msg, to_write)) {
+		encoded = cobs_encode(hs_msg, to_write, wire, sizeof(wire));
+		if (encoded < 0 || ash_serdev_write(ash, wire, encoded)) {
 			mutex_unlock(&ash->tx_lock);
 			return;
 		}
 	}
-	WRITE_ONCE(ash->conn_st, CONN_CONNECTED);
-	complete_all(&ash->connection_ready);
 
 	if (!done) {
 		hrtimer_start(&ash->restart_timer,
@@ -139,6 +138,8 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 		mutex_unlock(&ash->tx_lock);
 		return;
 	}
+	WRITE_ONCE(ash->conn_st, CONN_CONNECTED);
+	complete_all(&ash->connection_ready);
 
 	if (ash->autostart)
 		hrtimer_start(&ash->refresh_timer, 0, HRTIMER_MODE_REL_HARD);
@@ -279,7 +280,6 @@ static void ashen_receive_packet(void *ctx,
 {
 	struct ashen_tamper *ash = (struct ashen_tamper *)ctx;
 	u8 *frame = (u8 *)buf; /* framer buffer, in-place decrypt is fine */
-
 	mutex_lock(&ash->rx_lock);
 	switch (READ_ONCE(ash->conn_st)) {
 	case CONN_DISCONNECTED:
@@ -292,8 +292,10 @@ static void ashen_receive_packet(void *ctx,
 		mutex_unlock(&ash->rx_lock);
 		break;
 	case CONN_CONNECTED:
-		if (len < NOISE_MAC_LEN)
+		if (len < NOISE_MAC_LEN) {
+			mutex_unlock(&ash->rx_lock);
 			break;
+		}
 
 		if (!noise_decrypt_transport_message(&ash->noise_st,
 					frame, len, frame)) {

@@ -11,15 +11,15 @@
 #include <crypto/curve25519.h>
 #include <crypto/chacha20poly1305.h>
 #include <crypto/poly1305.h>
-#include <crypto/blake2s.h>
+#include <crypto/sha2.h>
 
 enum noise_lengths {
 	NOISE_PUBLIC_KEY_LEN = CURVE25519_KEY_SIZE,
 	NOISE_PRIVATE_KEY_LEN = CURVE25519_KEY_SIZE,
 	NOISE_SYMMETRIC_KEY_LEN = CHACHA20POLY1305_KEY_SIZE,
-	NOISE_HASH_LEN = BLAKE2S_HASH_SIZE,
+	NOISE_HASH_LEN = SHA256_DIGEST_SIZE,
 	NOISE_MAC_LEN = POLY1305_DIGEST_SIZE,
-	NOISE_MAX_HS_MSG_LEN = 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN,
+	NOISE_MAX_HS_MSG_LEN = 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN,
 };
 
 struct noise_keypair {
@@ -70,14 +70,14 @@ bool noise_handshake_read_msg_a(struct noise_handshake_state *st,
 		const u8 in[static NOISE_PUBLIC_KEY_LEN]);
 
 ssize_t noise_handshake_write_msg_b(struct noise_handshake_state *st,
-		u8 out[static 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN]);
+		u8 out[static 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN]);
 bool noise_handshake_read_msg_b(struct noise_handshake_state *st,
-		const u8 in[static 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN]);
+		const u8 in[static 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN]);
 
 ssize_t noise_handshake_write_msg_c(struct noise_handshake_state *st,
-		u8 out[static NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN]);
+		u8 out[static NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN]);
 bool noise_handshake_read_msg_c(struct noise_handshake_state *st,
-		const u8 in[static NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN]);
+		const u8 in[static NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN]);
 
 ssize_t noise_handshake(struct noise_state *st, const u8 *in, size_t in_len,
 		u8 out[static NOISE_MAX_HS_MSG_LEN], bool *done);

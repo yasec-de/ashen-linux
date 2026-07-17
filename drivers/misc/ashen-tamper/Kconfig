@@ -7,6 +7,7 @@ config ASHEN_TAMPER
 	tristate "Ashen Sensor Heartbeat Protocol Support"
 	select CRYPTO_LIB_CURVE25519
 	select CRYPTO_LIB_CHACHA20POLY1305
+	select CRYPTO_LIB_SHA256
 	help
 	  Enables Ashen tamper sensor heartbeat protocol support. The driver
 	  supports a configurable numer of UART heartbeat links, as well as a
@@ -17,6 +18,7 @@ config ASHEN_TAMPER_KUNIT_TEST
 	depends on KUNIT
 	select CRYPTO_LIB_CURVE25519
 	select CRYPTO_LIB_CHACHA20POLY1305
+	select CRYPTO_LIB_SHA256
 	default KUNIT_ALL_TESTS
 	help
 	  Protocol-level tests (COBS framing + Noise handshake/transport)
