@@ -71,14 +71,6 @@ static void ash_tx_work_fn(struct work_struct *w)
 		mutex_lock(&ash->tx_lock);
 		if (ash_tx_one(ash, &req)) {
 			dev_err(&ash->serdev->dev, "I/O error during payload transmission\n");
-		} else if (req.len == sizeof(struct ashen_msg_echo) &&
-			   req.payload[0] == ASHEN_MSG_ECHO_REQUEST &&
-			   !hrtimer_active(&ash->hb_timer)) {
-			/* Start the first response deadline only once the request has
-			 * actually reached serdev.  Starting it when the hrtimer merely
-			 * queues this work can panic during early-boot workqueue delays. */
-			hrtimer_start(&ash->hb_timer, ash->timeout,
-					HRTIMER_MODE_REL_HARD);
 		}
 		mutex_unlock(&ash->tx_lock);
 	}
@@ -257,7 +249,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 					"received echo response stale by %llu ns\n",
 					delta_ns);
 		} else {
-			/* Restart the timer. */
+			/* (Re)start the timer. */
 			hrtimer_start(&ash->hb_timer, ash->timeout,
 					HRTIMER_MODE_REL_HARD);
 		}

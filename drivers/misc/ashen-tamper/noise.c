@@ -16,9 +16,7 @@
  * -> s, se			message "c"
  */
 
-/* The protocol name is exactly one SHA-256 digest wide and excludes the
- * terminating NUL, as required by the Noise initialization rules. */
-static const u8 handshake_name[NOISE_HASH_LEN] __nonstring =
+static const u8 handshake_name[] =
 	"Noise_XX_25519_ChaChaPoly_SHA256";
 
 static void mix_hash(struct noise_handshake_state *st, const u8 *src, size_t src_len)
@@ -36,13 +34,11 @@ void noise_init(struct noise_state *st, bool i_am_the_initiator)
 	memzero_explicit(st, sizeof(*st));
 	st->hs.i_am_the_initiator = i_am_the_initiator;
 
-	/* The protocol name is exactly HASHLEN bytes, so Noise initializes h and
-	 * ck to the name itself rather than hashing or padding it. */
-	memcpy(st->hs.ss.chaining_key, handshake_name, sizeof(handshake_name));
+	/* noise spec says: hash the name only if it's longer than the digest size  */
+	static_assert(strlen(handshake_name) <= sizeof(st->hs.ss.chaining_key));
+	memcpy(st->hs.ss.chaining_key, handshake_name, strlen(handshake_name));
 	memcpy(st->hs.ss.hash, st->hs.ss.chaining_key, NOISE_HASH_LEN);
-	/* Both firmware and host use the default empty prologue. Noise still
-	 * applies MixHash(prologue) when it is empty; skipping this produces the
-	 * same cipher keys but different handshake authentication tags. */
+	/* empty prologue */
 	mix_hash(&st->hs, NULL, 0);
 }
 
@@ -100,7 +96,7 @@ static void hkdf2(u8 output1[static NOISE_HASH_LEN], u8 output2[static NOISE_HAS
 	hmac(output, output, 1, temp_key);
 	memcpy(output1, output, NOISE_HASH_LEN);
 
-	/* Expand output2 = hmac(output1 || 0x02) */
+	/* Expand output2 = hmac(output1 + [0x02]) */
 	output[NOISE_HASH_LEN] = 2;
 	hmac(output2, output, NOISE_HASH_LEN + 1, temp_key);
 
@@ -124,12 +120,12 @@ static void __maybe_unused hkdf3(u8 output1[static NOISE_HASH_LEN], u8 output2[s
 	hmac(output, output, 1, temp_key);
 	memcpy(output1, output, NOISE_HASH_LEN);
 
-	/* Expand output2 = hmac(output1 || 0x02) */
+	/* Expand output2 = hmac(output1 + [0x02]) */
 	output[NOISE_HASH_LEN] = 2;
 	hmac(output, output, NOISE_HASH_LEN + 1, temp_key);
 	memcpy(output2, output, NOISE_HASH_LEN);
 
-	/* Expand output3 = hmac(output2 || 0x03) */
+	/* Expand output3 = hmac(output2 + [0x03]) */
 	output[NOISE_HASH_LEN] = 3;
 	hmac(output3, output, NOISE_HASH_LEN + 1, temp_key);
 
@@ -229,8 +225,7 @@ ssize_t noise_handshake_write_msg_b(struct noise_handshake_state *st,
 	if (!mix_key_dh(st, &st->loc_static, &st->rem_ephem))
 		return -EINVAL;
 
-	/* payload: even an empty payload emits an authentication tag once the
-	 * handshake has a cipher key. */
+	/* empty payload */
 	encrypt_and_hash(st, out + 2 * NOISE_PUBLIC_KEY_LEN + NOISE_MAC_LEN, 0);
 	return 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN;
 }
@@ -361,7 +356,6 @@ static ssize_t noise_handshake_initiator(struct noise_state *st,
 			ret = noise_handshake_write_msg_c(&st->hs, out);
 			if (ret < 0)
 				return ret;
-			/* msg c is the last: once it's on the wire we're done */
 			noise_handshake_split(st);
 			*done = true;
 			return ret;
@@ -386,7 +380,6 @@ static ssize_t noise_handshake_responder(struct noise_state *st,
 			return -EINVAL;
 		if (!noise_handshake_read_msg_c(&st->hs, in))
 			return -EBADMSG;
-		/* handshake complete: derive transport keys, no reply to send */
 		noise_handshake_split(st);
 		*done = true;
 		return 0;
