@@ -23,11 +23,91 @@
 #define ASHEN_TAMPER_DEFAULT_REFRESH_IVL_US 5000
 #define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
 #define ASHEN_TAMPER_RX_BUF_SIZE 256
-#define ASHEN_TAMPER_HS_TIMEOUT_US 250000
+#define ASHEN_TAMPER_HS_TIMEOUT_US 10000000
 #define ASHEN_TAMPER_RESET_LEN 8
+/* Nulls the responder replies with after accepting a reset; must match the
+ * firmware's RESET_REPLY_NULLS in ashen-fw/src/framing.rs. */
+#define ASHEN_TAMPER_RESET_REPLY_NULLS 32
 
+
+static void ash_trace_arm(struct ashen_tamper *ash)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&ash->trace_lock, flags);
+	if (!ash->trace_active) {
+		ash->trace_active = true;
+		ash->trace_head = 0;
+		ash->trace_count = 0;
+	}
+	spin_unlock_irqrestore(&ash->trace_lock, flags);
+}
+
+static void ash_trace_bytes(struct ashen_tamper *ash, char dir,
+		const u8 *buf, size_t len)
+{
+	unsigned long flags;
+	size_t i;
+	spin_lock_irqsave(&ash->trace_lock, flags);
+	if (!ash->trace_active) {
+		spin_unlock_irqrestore(&ash->trace_lock, flags);
+		return;
+	}
+	for (i = 0; i < len; i++) {
+		size_t pos = ash->trace_head;
+		ash->trace_buf[pos] = buf[i];
+		ash->trace_dir[pos] = dir;
+		ash->trace_head = (pos + 1) % ASHEN_TRACE_LEN;
+		if (ash->trace_count < ASHEN_TRACE_LEN)
+			ash->trace_count++;
+	}
+	spin_unlock_irqrestore(&ash->trace_lock, flags);
+}
+
+/* Dump the trace ring once and disarm. Safe from softirq (timer) context. */
+static void ash_trace_dump(struct ashen_tamper *ash)
+{
+	unsigned long flags;
+	size_t count, start, i, run;
+	static u8 snap[ASHEN_TRACE_LEN];
+	static char dirs[ASHEN_TRACE_LEN];
+
+	spin_lock_irqsave(&ash->trace_lock, flags);
+	if (!ash->trace_active) {
+		spin_unlock_irqrestore(&ash->trace_lock, flags);
+		return;
+	}
+	count = ash->trace_count;
+	/* Oldest entry: if the ring wrapped, it's at head; else at 0. */
+	start = (ash->trace_count == ASHEN_TRACE_LEN) ? ash->trace_head : 0;
+	for (i = 0; i < count; i++) {
+		size_t pos = (start + i) % ASHEN_TRACE_LEN;
+		snap[i] = ash->trace_buf[pos];
+		dirs[i] = ash->trace_dir[pos];
+	}
+	ash->trace_active = false;
+	spin_unlock_irqrestore(&ash->trace_lock, flags);
+
+	dev_info(&ash->serdev->dev, "trace dump: %zu bytes\n", count);
+	/* Print in direction-grouped runs, 16 bytes per line, so TX and RX
+	 * are visually separable in the hex. */
+	i = 0;
+	while (i < count) {
+		char line[16 * 3 + 1];
+		char dir = dirs[i];
+		int off = 0;
+		run = 0;
+		while (i + run < count && dirs[i + run] == dir && run < 16) {
+			off += scnprintf(line + off, sizeof(line) - off,
+					"%02x ", snap[i + run]);
+			run++;
+		}
+		dev_info(&ash->serdev->dev, "  %c: %s\n", dir, line);
+		i += run;
+	}
+}
 
 static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
+	ash_trace_bytes(ash, 'T', msg, msg_len);
 	if (msg_len == serdev_device_write(ash->serdev, msg, msg_len,
 			ASHEN_TAMPER_SERDEV_TIMEOUT)) {
 		return 0;
@@ -154,6 +234,7 @@ static void ashen_restart_handshake(struct work_struct *w)
 	struct ashen_tamper *ash = container_of(w, struct ashen_tamper, restart_work);
 	static const u8 reset[ASHEN_TAMPER_RESET_LEN] = {0};
 	unsigned long flags;
+	ash_trace_arm(ash);
 	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
 	mutex_lock(&ash->rx_lock);
 	mutex_lock(&ash->tx_lock);
@@ -184,9 +265,14 @@ static void ashen_restart_handshake(struct work_struct *w)
 	}
 	ash->framer->rx_len = 0;
 	ash->framer->sync = 0;
-	WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
+	ash->reset_nulls_seen = 0;
+	/* Wait for the responder's null reply before starting Noise: it only
+	 * arms (begins passing frame bytes up) once it has accepted our reset. */
+	WRITE_ONCE(ash->conn_st, CONN_RESET_WAIT);
+	hrtimer_start(&ash->restart_timer,
+			us_to_ktime(ASHEN_TAMPER_HS_TIMEOUT_US),
+			HRTIMER_MODE_REL_SOFT);
 	mutex_unlock(&ash->tx_lock);
-	ashen_continue_handshake(ash, NULL, 0);
 	mutex_unlock(&ash->rx_lock);
 }
 
@@ -310,13 +396,54 @@ static void ashen_receive_packet(void *ctx,
 		mutex_unlock(&ash->rx_lock);
 		ashen_handle_packet(ash, frame, len - NOISE_MAC_LEN);
 		break;
+	default: /* CONN_RESET_WAIT: no frames expected here, drop it */
+		mutex_unlock(&ash->rx_lock);
+		break;
 	}
+}
+
+/* Watch for the responder's null reply while in CONN_RESET_WAIT. Counts the
+ * leading null run; once the full reply is seen, starts the Noise handshake
+ * (sends msg A) and switches to CONN_HANDSHAKE. Bytes are NOT consumed here --
+ * the reply nulls double as the framer's sync run, so the caller still pushes
+ * the whole buffer through the framer. A non-null before the reply completes
+ * restarts the count, tolerating stray bytes in the RX ring. */
+static void ashen_watch_reset_reply(struct ashen_tamper *ash,
+		const u8 *buf, size_t size)
+{
+	size_t i;
+
+	mutex_lock(&ash->rx_lock);
+	if (READ_ONCE(ash->conn_st) != CONN_RESET_WAIT) {
+		mutex_unlock(&ash->rx_lock);
+		return;
+	}
+
+	for (i = 0; i < size; i++) {
+		if (buf[i] != 0x00) {
+			ash->reset_nulls_seen = 0;
+			continue;
+		}
+		if (++ash->reset_nulls_seen == ASHEN_TAMPER_RESET_REPLY_NULLS) {
+			WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
+			ashen_continue_handshake(ash, NULL, 0);
+			break;
+		}
+	}
+	mutex_unlock(&ash->rx_lock);
 }
 
 static size_t ashen_serdev_receive(struct serdev_device *serdev,
 		const u8 *buf, size_t size)
 {
 	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
+	ash_trace_bytes(ash, 'R', buf, size);
+
+	if (READ_ONCE(ash->conn_st) == CONN_RESET_WAIT)
+		ashen_watch_reset_reply(ash, buf, size);
+
+	/* The framer syncs on the reply's leading null run, so feed it everything
+	 * including the reply nulls. */
 	return ashen_framer_push(ash->framer, buf, size);
 }
 
@@ -347,6 +474,7 @@ ash_restart_timer_fn(struct hrtimer *t)
 
 	dev_warn_ratelimited(&ash->serdev->dev,
 			"handshake timed out, retrying\n");
+	ash_trace_dump(ash);
 	queue_work(ash->tx_wq, &ash->restart_work);
 	return HRTIMER_NORESTART;
 }
@@ -569,6 +697,7 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	mutex_init(&ash->rx_lock);
 
 	spin_lock_init(&ash->tx_queue_lock);
+	spin_lock_init(&ash->trace_lock);
 	INIT_KFIFO(ash->tx_queue);
 	INIT_WORK(&ash->tx_work, ash_tx_work_fn);
 	INIT_WORK(&ash->restart_work, ashen_restart_handshake);

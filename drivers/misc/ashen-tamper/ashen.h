@@ -14,6 +14,7 @@
 
 enum ashen_connstate {
 	CONN_DISCONNECTED,
+	CONN_RESET_WAIT, /* reset sent, draining the responder's null reply */
 	CONN_HANDSHAKE,
 	CONN_CONNECTED,
 };
@@ -42,6 +43,7 @@ struct ashen_tamper {
 	ktime_t timeout;
 	bool autostart;
 	bool armed;
+	size_t reset_nulls_seen; /* null-reply bytes drained in CONN_RESET_WAIT */
 	struct ashen_framer *framer;
 
 	struct work_struct tx_work;
@@ -53,6 +55,14 @@ struct ashen_tamper {
 	struct mutex tx_lock;
 	struct mutex rx_lock;
 	unsigned char tx_buf[256];
+
+#define ASHEN_TRACE_LEN 8192
+	spinlock_t trace_lock;
+	bool trace_active;
+	size_t trace_head;
+	size_t trace_count;
+	u8 trace_buf[ASHEN_TRACE_LEN]; /* high bit of each byte = TX, low 8 held below */
+	u8 trace_dir[ASHEN_TRACE_LEN]; /* 'T' or 'R' */
 };
 
 #endif /* __ASHEN_H__ */
