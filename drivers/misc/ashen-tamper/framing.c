@@ -25,27 +25,27 @@ static size_t ashen_framer_chunk(struct ashen_framer *f,
 		return 1;
 	}
 
-	if (f->len + null_pos > f->cap) {
+	if (f->rx_len + null_pos > f->bufsize) {
 		f->sync = 0;
-		f->len = 0;
+		f->rx_len = 0;
 		pr_warn("ashen-tamper: receive buffer overrun\n");
 		/* drop this chunk; also skip the delimiter if we saw one */
 		return null_pos + found_null;
 	}
 
-	memcpy(f->buf + f->len, buf, null_pos);
-	f->len += null_pos;
+	memcpy(f->buf + f->rx_len, buf, null_pos);
+	f->rx_len += null_pos;
 
 	if (!found_null)
 		return size;
 
-	len = cobs_decode(f->buf, f->len, f->buf, f->cap);
+	len = cobs_decode(f->buf, f->rx_len, f->buf, f->bufsize);
 	if (len >= 0) {
 		f->on_frame(f->ctx, f->buf, len);
 	} else if (len == -EINTR) {
 		pr_warn("ashen-tamper: truncated frame received\n");
 	}/* else: consecutive null bytes received. ignore. */
-	f->len = 0;
+	f->rx_len = 0;
 	return null_pos + 1; /* consume the delimiter too */
 }
 

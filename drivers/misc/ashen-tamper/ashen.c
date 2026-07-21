@@ -5,6 +5,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/hex.h>
 #include <linux/hrtimer.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -25,7 +26,6 @@
 #define ASHEN_TAMPER_HS_TIMEOUT_US 250000
 #define ASHEN_TAMPER_RESET_LEN 8
 
-static void ashen_queue_restart(struct ashen_tamper *ash);
 
 static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
 	if (msg_len == serdev_device_write(ash->serdev, msg, msg_len,
@@ -34,7 +34,7 @@ static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
 	}
 	dev_err_ratelimited(&ash->serdev->dev,
 			"I/O error writing to serial\n");
-	ashen_queue_restart(ash);
+	queue_work(ash->tx_wq, &ash->restart_work);
 	return -EIO;
 }
 
@@ -100,11 +100,6 @@ static int ash_send_envelope(struct ashen_tamper *ash,
 	return 0;
 }
 
-static void ashen_queue_restart(struct ashen_tamper *ash)
-{
-	queue_work(ash->tx_wq, &ash->restart_work);
-}
-
 static void ashen_continue_handshake(struct ashen_tamper *ash,
 		const u8 *buf, size_t len)
 {
@@ -119,7 +114,7 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 	to_write = noise_handshake(&ash->noise_st, buf, len, hs_msg, &done);
 	if (to_write < 0) {
 		dev_err_ratelimited(&ash->serdev->dev, "noise handshake error\n");
-		ashen_queue_restart(ash);
+		queue_work(ash->tx_wq, &ash->restart_work);
 		return;
 	}
 
@@ -149,6 +144,8 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 	if (ash_send_envelope(ash, &type, sizeof(type)))
 		dev_err(&ash->serdev->dev,
 				"failed to send status request\n");
+
+	dev_info(&ash->serdev->dev, "handshake completed\n");
 	mutex_unlock(&ash->tx_lock);
 }
 
@@ -163,6 +160,8 @@ static void ashen_restart_handshake(struct work_struct *w)
 	if (hrtimer_active(&ash->refresh_timer)) {
 		ash->autostart = true;
 		hrtimer_cancel(&ash->refresh_timer);
+	} else {
+		ash->autostart = false;
 	}
 	reinit_completion(&ash->connection_ready);
 
@@ -172,22 +171,18 @@ static void ashen_restart_handshake(struct work_struct *w)
 
 	serdev_device_write_flush(ash->serdev);
 
+	dev_info(&ash->serdev->dev, "reconnecting\n");
+	ash->have_status = false; /* stale for the new connection */
 	noise_init(&ash->noise_st, true);
-	if (!noise_keypair_generate(&ash->noise_st.hs.loc_static)) {
-		mutex_unlock(&ash->rx_lock);
-		mutex_unlock(&ash->tx_lock);
-		dev_err_ratelimited(&ash->serdev->dev,
-				"unable to generate static keypair. giving up.\n");
-		return;
-	}
+	ash->noise_st.hs.loc_static = ash->loc_static;
 
 	if (ash_serdev_write(ash, reset, sizeof(reset))) {
 		mutex_unlock(&ash->rx_lock);
 		mutex_unlock(&ash->tx_lock);
-		ashen_queue_restart(ash);
+		queue_work(ash->tx_wq, &ash->restart_work);
 		return;
 	}
-	ash->framer->len = 0;
+	ash->framer->rx_len = 0;
 	ash->framer->sync = 0;
 	WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
 	mutex_unlock(&ash->tx_lock);
@@ -218,7 +213,10 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 
 		if (len != sizeof(*msg))
 			goto malformed;
-		dev_info(&ash->serdev->dev, "pairing successful\n");
+		if (msg->success)
+			dev_info(&ash->serdev->dev, "pairing successful\n");
+		else
+			dev_err(&ash->serdev->dev, "pairing usuccessful\n");
 
 		type = ASHEN_MSG_STATUS_REQUEST;
 		ret = ash_send_envelope(ash, &type, sizeof(type));
@@ -232,6 +230,9 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 
 		if (len != sizeof(*msg))
 			goto malformed;
+		ash->peer_keyed = msg->is_keyed;
+		ash->peer_trusts_us = msg->peer_trusted;
+		ash->have_status = true;
 		dev_info(&ash->serdev->dev,
 				"status: peer_trusted=%d is_keyed=%d\n",
 				msg->peer_trusted, msg->is_keyed);
@@ -248,7 +249,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 			dev_warn(&ash->serdev->dev,
 					"received echo response stale by %llu ns\n",
 					delta_ns);
-		} else {
+		} else if (hrtimer_active(&ash->refresh_timer)) {
 			/* (Re)start the timer. */
 			hrtimer_start(&ash->hb_timer, ash->timeout,
 					HRTIMER_MODE_REL_HARD);
@@ -300,9 +301,9 @@ static void ashen_receive_packet(void *ctx,
 
 		if (!noise_decrypt_transport_message(&ash->noise_st,
 					frame, len, frame)) {
-			dev_warn_ratelimited(&ash->serdev->dev,
+			dev_err(&ash->serdev->dev,
 					"transport decrypt failed, restarting\n");
-			ashen_queue_restart(ash);
+			queue_work(ash->tx_wq, &ash->restart_work);
 			mutex_unlock(&ash->rx_lock);
 			break;
 		}
@@ -346,7 +347,7 @@ ash_restart_timer_fn(struct hrtimer *t)
 
 	dev_warn_ratelimited(&ash->serdev->dev,
 			"handshake timed out, retrying\n");
-	ashen_queue_restart(ash);
+	queue_work(ash->tx_wq, &ash->restart_work);
 	return HRTIMER_NORESTART;
 }
 
@@ -392,16 +393,27 @@ static ssize_t armed_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%d\n", hrtimer_active(&ash->hb_timer));
 }
 
-static DEVICE_ATTR_RO(armed);
-
-static ssize_t connected_show(struct device *dev, struct device_attribute *attr,
-			  char *buf)
+static ssize_t armed_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
 {
 	struct ashen_tamper *ash = dev_get_drvdata(dev);
-	return sysfs_emit(buf, "%d\n", ash->conn_st == CONN_CONNECTED);
+	bool arm;
+	int ret = kstrtobool(buf, &arm);
+	if (ret)
+		return ret;
+
+	if (arm) {
+		if (ash->conn_st != CONN_CONNECTED)
+			return -ENOTCONN;
+		hrtimer_start(&ash->refresh_timer, 0, HRTIMER_MODE_REL_HARD);
+	} else {
+		hrtimer_cancel(&ash->refresh_timer);
+		hrtimer_cancel(&ash->hb_timer);
+	}
+	return count;
 }
 
-static DEVICE_ATTR_RO(connected);
+static DEVICE_ATTR_RW(armed);
 
 static ssize_t action_store(struct device *dev, struct device_attribute *attr,
 			  const char *buf, size_t count)
@@ -410,12 +422,19 @@ static ssize_t action_store(struct device *dev, struct device_attribute *attr,
 	int ret;
 	u8 msg;
 
+	if (sysfs_streq(buf, "reconnect")) {
+		queue_work(ash->tx_wq, &ash->restart_work);
+		return count;
+	}
+
 	if (ash->conn_st != CONN_CONNECTED)
 		return -ENOTCONN;
 
 	if (sysfs_streq(buf, "erase")) {
 		msg = ASHEN_MSG_ERASE;
 		ret = ash_send_envelope(ash, &msg, sizeof(msg));
+		if (!ret)
+			queue_work(ash->tx_wq, &ash->restart_work);
 	} else if (sysfs_streq(buf, "pair")) {
 		msg = ASHEN_MSG_PAIR_REQUEST;
 		ret = ash_send_envelope(ash, &msg, sizeof(msg));
@@ -428,12 +447,70 @@ static ssize_t action_store(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_WO(action);
 
+static ssize_t status_show(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	struct noise_keypair *loc = &ash->noise_st.hs.loc_static;
+	int len;
+
+	len = sysfs_emit(buf, "connected %d\n",
+			ash->conn_st == CONN_CONNECTED);
+	mutex_lock(&ash->rx_lock);
+	if (loc->has_key)
+		len += sysfs_emit_at(buf, len, "local_pubkey %*phN\n",
+				NOISE_PUBLIC_KEY_LEN, loc->public);
+	mutex_unlock(&ash->rx_lock);
+	if (ash->have_status) {
+		len += sysfs_emit_at(buf, len, "peer_keyed %d\n",
+				ash->peer_keyed);
+		len += sysfs_emit_at(buf, len, "peer_trusts_us %d\n",
+				ash->peer_trusts_us);
+	}
+	return len;
+}
+
+static DEVICE_ATTR_RO(status);
+
+static ssize_t local_privkey_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	struct noise_keypair kp = {};
+
+	if (hex2bin(kp.private, buf, NOISE_PRIVATE_KEY_LEN))
+		return -EINVAL;
+	if (!curve25519_generate_public(kp.public, kp.private))
+		return -EINVAL;
+	kp.has_key = true;
+
+	ash->loc_static = kp;
+	queue_work(ash->tx_wq, &ash->restart_work);
+	return count;
+}
+
+static DEVICE_ATTR_WO(local_privkey);
+
+static ssize_t remote_pubkey_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	struct noise_pubkey *rem = &ash->noise_st.hs.rem_static;
+	if (!rem->has_key)
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%*phN\n", NOISE_PUBLIC_KEY_LEN, rem->public);
+}
+
+static DEVICE_ATTR_RO(remote_pubkey);
+
 static struct attribute *ashen_attrs[] = {
 	&dev_attr_timeout.attr,
 	&dev_attr_refresh_ivl.attr,
 	&dev_attr_armed.attr,
-	&dev_attr_connected.attr,
+	&dev_attr_status.attr,
 	&dev_attr_action.attr,
+	&dev_attr_local_privkey.attr,
+	&dev_attr_remote_pubkey.attr,
 	NULL,
 };
 
@@ -464,7 +541,7 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 		ret = -ENOMEM;
 		goto error;
 	}
-	ash->framer->cap = ASHEN_TAMPER_RX_BUF_SIZE;
+	ash->framer->bufsize = ASHEN_TAMPER_RX_BUF_SIZE;
 	ash->framer->on_frame = ashen_receive_packet;
 	ash->framer->ctx = ash;
 
@@ -479,6 +556,12 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	val = ASHEN_TAMPER_DEFAULT_REFRESH_IVL_US;
 	of_property_read_u32(serdev->dev.of_node, "refresh-ivl-us", &val);
 	ash->refresh_ivl = us_to_ktime(val);
+
+	if (!noise_keypair_generate(&ash->loc_static)) {
+		dev_err(&serdev->dev, "unable to generate static keypair\n");
+		ret = -EIO;
+		goto error;
+	}
 
 	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
 	init_completion(&ash->connection_ready);

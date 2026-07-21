@@ -12,12 +12,12 @@
 #define FRAMER_SYNC_NULLS 8
 
 struct ashen_framer {
-	size_t cap;	/* usable size of buf[] */
-	size_t len;
+	size_t bufsize;
+	size_t rx_len;
 	int sync;
 	void (*on_frame)(void *ctx, const u8 *frame, size_t len);
 	void *ctx;
-	u8 buf[];	/* flexible array member, must stay last */
+	u8 buf[];
 };
 
 size_t ashen_framer_push(struct ashen_framer *f, const u8 *buf, size_t size);

@@ -32,11 +32,16 @@ struct ashen_tamper {
 	struct hrtimer restart_timer;
 	struct serdev_device *serdev;
 	struct noise_state noise_st;
+	struct noise_keypair loc_static; /* persistent local identity */
+	bool peer_keyed;    /* cached is_keyed from last status response */
+	bool peer_trusts_us; /* cached peer_trusted from last status response */
+	bool have_status;   /* a status response has been seen */
 	enum ashen_connstate conn_st;
 	struct completion connection_ready;
 	ktime_t refresh_ivl;
 	ktime_t timeout;
 	bool autostart;
+	bool armed;
 	struct ashen_framer *framer;
 
 	struct work_struct tx_work;
