@@ -25,8 +25,6 @@
 #define ASHEN_TAMPER_RX_BUF_SIZE 256
 #define ASHEN_TAMPER_HS_TIMEOUT_US 10000000
 #define ASHEN_TAMPER_RESET_LEN 8
-/* Nulls the responder replies with after accepting a reset; must match the
- * firmware's RESET_REPLY_NULLS in ashen-fw/src/framing.rs. */
 #define ASHEN_TAMPER_RESET_REPLY_NULLS 32
 
 
@@ -256,6 +254,7 @@ static void ashen_restart_handshake(struct work_struct *w)
 	ash->have_status = false; /* stale for the new connection */
 	noise_init(&ash->noise_st, true);
 	ash->noise_st.hs.loc_static = ash->loc_static;
+	ashen_framer_reset(ash->framer);
 
 	if (ash_serdev_write(ash, reset, sizeof(reset))) {
 		mutex_unlock(&ash->rx_lock);
@@ -263,12 +262,7 @@ static void ashen_restart_handshake(struct work_struct *w)
 		queue_work(ash->tx_wq, &ash->restart_work);
 		return;
 	}
-	ash->framer->rx_len = 0;
-	ash->framer->sync = 0;
-	ash->reset_nulls_seen = 0;
-	/* Wait for the responder's null reply before starting Noise: it only
-	 * arms (begins passing frame bytes up) once it has accepted our reset. */
-	WRITE_ONCE(ash->conn_st, CONN_RESET_WAIT);
+	WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
 	hrtimer_start(&ash->restart_timer,
 			us_to_ktime(ASHEN_TAMPER_HS_TIMEOUT_US),
 			HRTIMER_MODE_REL_SOFT);
@@ -363,6 +357,12 @@ malformed:
 	dev_warn(&ash->serdev->dev, "malformed message type %d\n", buf[0]);
 }
 
+static void ashen_framer_reset_handler(void *ctx)
+{
+	struct ashen_tamper *ash = (struct ashen_tamper *)ctx;
+	ashen_continue_handshake(ash, NULL, 0); /* start handshake */
+}
+
 static void ashen_receive_packet(void *ctx,
 		const u8 *buf, size_t len)
 {
@@ -402,48 +402,11 @@ static void ashen_receive_packet(void *ctx,
 	}
 }
 
-/* Watch for the responder's null reply while in CONN_RESET_WAIT. Counts the
- * leading null run; once the full reply is seen, starts the Noise handshake
- * (sends msg A) and switches to CONN_HANDSHAKE. Bytes are NOT consumed here --
- * the reply nulls double as the framer's sync run, so the caller still pushes
- * the whole buffer through the framer. A non-null before the reply completes
- * restarts the count, tolerating stray bytes in the RX ring. */
-static void ashen_watch_reset_reply(struct ashen_tamper *ash,
-		const u8 *buf, size_t size)
-{
-	size_t i;
-
-	mutex_lock(&ash->rx_lock);
-	if (READ_ONCE(ash->conn_st) != CONN_RESET_WAIT) {
-		mutex_unlock(&ash->rx_lock);
-		return;
-	}
-
-	for (i = 0; i < size; i++) {
-		if (buf[i] != 0x00) {
-			ash->reset_nulls_seen = 0;
-			continue;
-		}
-		if (++ash->reset_nulls_seen == ASHEN_TAMPER_RESET_REPLY_NULLS) {
-			WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
-			ashen_continue_handshake(ash, NULL, 0);
-			break;
-		}
-	}
-	mutex_unlock(&ash->rx_lock);
-}
-
 static size_t ashen_serdev_receive(struct serdev_device *serdev,
 		const u8 *buf, size_t size)
 {
 	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
 	ash_trace_bytes(ash, 'R', buf, size);
-
-	if (READ_ONCE(ash->conn_st) == CONN_RESET_WAIT)
-		ashen_watch_reset_reply(ash, buf, size);
-
-	/* The framer syncs on the reply's leading null run, so feed it everything
-	 * including the reply nulls. */
 	return ashen_framer_push(ash->framer, buf, size);
 }
 
@@ -671,7 +634,9 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	}
 	ash->framer->bufsize = ASHEN_TAMPER_RX_BUF_SIZE;
 	ash->framer->on_frame = ashen_receive_packet;
+	ash->framer->on_reset = ashen_framer_reset_handler;
 	ash->framer->ctx = ash;
+	ashen_framer_reset(ash->framer);
 
 	of_property_read_u32(serdev->dev.of_node, "baudrate", &baudrate);
 

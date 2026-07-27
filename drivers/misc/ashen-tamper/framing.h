@@ -12,14 +12,17 @@
 #define FRAMER_SYNC_NULLS 8
 
 struct ashen_framer {
-	size_t bufsize;
 	size_t rx_len;
-	int sync;
+	bool sync;
+	size_t null_run; 
 	void (*on_frame)(void *ctx, const u8 *frame, size_t len);
+	void (*on_reset)(void *ctx);
 	void *ctx;
+	size_t bufsize;
 	u8 buf[];
 };
 
 size_t ashen_framer_push(struct ashen_framer *f, const u8 *buf, size_t size);
+void ashen_framer_reset(struct ashen_framer *f);
 
 #endif /* _ASHEN_FRAMING_H */

@@ -16,18 +16,8 @@ static size_t ashen_framer_chunk(struct ashen_framer *f,
 	size_t null_pos = strnlen(buf, size);
 	bool found_null = null_pos < size;
 
-	if (f->sync < FRAMER_SYNC_NULLS) {
-		if (null_pos) {
-			f->sync = 0;
-			return null_pos;
-		}
-		f->sync++;
-		return 1;
-	}
-
 	if (f->rx_len + null_pos > f->bufsize) {
-		f->sync = 0;
-		f->rx_len = 0;
+		ashen_framer_reset(f);
 		pr_warn("ashen-tamper: receive buffer overrun\n");
 		/* drop this chunk; also skip the delimiter if we saw one */
 		return null_pos + found_null;
@@ -49,15 +39,42 @@ static size_t ashen_framer_chunk(struct ashen_framer *f,
 	return null_pos + 1; /* consume the delimiter too */
 }
 
+void ashen_framer_reset(struct ashen_framer *f) {
+	f->null_run = 0;
+	f->sync = false;
+	f->rx_len = 0;
+}
+
 size_t ashen_framer_push(struct ashen_framer *f, const u8 *buf, size_t size)
 {
 	size_t consumed = 0;
 	size_t chunk;
+
+	while (size && !f->sync) {
+		while (size && *buf == 0x00) {
+			buf++;
+			size--;
+			f->null_run ++;
+		}
+
+		if (size && f->null_run >= FRAMER_SYNC_NULLS) {
+			f->sync = true;
+			f->on_reset(f->ctx);
+			break;
+		}
+
+		while (size && *buf != 0x00) {
+			buf++;
+			size--;
+			f->null_run = 0;
+		}
+	}
 
 	while (size && (chunk = ashen_framer_chunk(f, buf, size))) {
 		buf += chunk;
 		size -= chunk;
 		consumed += chunk;
 	}
+
 	return consumed;
 }
