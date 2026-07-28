@@ -24,84 +24,72 @@
 #define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
 #define ASHEN_TAMPER_RX_BUF_SIZE 256
 #define ASHEN_TAMPER_HS_TIMEOUT_US 10000000
-#define ASHEN_TAMPER_RESET_LEN 8
-#define ASHEN_TAMPER_RESET_REPLY_NULLS 32
+#define ASHEN_TAMPER_ERASE_DURATION_US 250000
+#define ASHEN_TAMPER_RESET_LEN 32
 
 
-static void ash_trace_arm(struct ashen_tamper *ash)
+#define ASHEN_TRACE_IDLE_MS 100
+
+static bool ash_trace_flush_locked(struct ashen_tamper *ash, unsigned long *flags)
+	__releases(&ash->trace_lock) __acquires(&ash->trace_lock)
 {
-	unsigned long flags;
-	spin_lock_irqsave(&ash->trace_lock, flags);
-	if (!ash->trace_active) {
-		ash->trace_active = true;
-		ash->trace_head = 0;
-		ash->trace_count = 0;
-	}
-	spin_unlock_irqrestore(&ash->trace_lock, flags);
+	u8 buf[ASHEN_TRACE_LINE];
+	char line[ASHEN_TRACE_LINE * 3 + 1];
+	size_t len = ash->trace_len;
+	char dir = ash->trace_dir;
+	int off = 0;
+	size_t i;
+
+	if (!len)
+		return false;
+
+	memcpy(buf, ash->trace_buf, len);
+	ash->trace_len = 0;
+	ash->trace_dir = 0;
+
+	spin_unlock_irqrestore(&ash->trace_lock, *flags);
+	for (i = 0; i < len; i++)
+		off += scnprintf(line + off, sizeof(line) - off, "%02x ", buf[i]);
+	dev_info(&ash->serdev->dev, "  %c: %s\n", dir, line);
+	spin_lock_irqsave(&ash->trace_lock, *flags);
+	return true;
 }
 
+/* Called from IRQ context (RX) and process context (TX). */
 static void ash_trace_bytes(struct ashen_tamper *ash, char dir,
 		const u8 *buf, size_t len)
 {
 	unsigned long flags;
 	size_t i;
+
 	spin_lock_irqsave(&ash->trace_lock, flags);
-	if (!ash->trace_active) {
-		spin_unlock_irqrestore(&ash->trace_lock, flags);
-		return;
-	}
 	for (i = 0; i < len; i++) {
-		size_t pos = ash->trace_head;
-		ash->trace_buf[pos] = buf[i];
-		ash->trace_dir[pos] = dir;
-		ash->trace_head = (pos + 1) % ASHEN_TRACE_LEN;
-		if (ash->trace_count < ASHEN_TRACE_LEN)
-			ash->trace_count++;
+		if (ash->trace_len && ash->trace_dir != dir)
+			ash_trace_flush_locked(ash, &flags);
+
+		ash->trace_dir = dir;
+		ash->trace_buf[ash->trace_len++] = buf[i];
+		if (ash->trace_len == ASHEN_TRACE_LINE)
+			ash_trace_flush_locked(ash, &flags);
 	}
 	spin_unlock_irqrestore(&ash->trace_lock, flags);
+
+	/* Restart the idle timeout so a short trailing run still gets out. */
+	if (len)
+		hrtimer_start(&ash->trace_timer,
+				ms_to_ktime(ASHEN_TRACE_IDLE_MS),
+				HRTIMER_MODE_REL_SOFT);
 }
 
-/* Dump the trace ring once and disarm. Safe from softirq (timer) context. */
-static void ash_trace_dump(struct ashen_tamper *ash)
+static enum hrtimer_restart ash_trace_timer_fn(struct hrtimer *t)
 {
+	struct ashen_tamper *ash = container_of(t, struct ashen_tamper, trace_timer);
 	unsigned long flags;
-	size_t count, start, i, run;
-	static u8 snap[ASHEN_TRACE_LEN];
-	static char dirs[ASHEN_TRACE_LEN];
 
 	spin_lock_irqsave(&ash->trace_lock, flags);
-	if (!ash->trace_active) {
-		spin_unlock_irqrestore(&ash->trace_lock, flags);
-		return;
-	}
-	count = ash->trace_count;
-	/* Oldest entry: if the ring wrapped, it's at head; else at 0. */
-	start = (ash->trace_count == ASHEN_TRACE_LEN) ? ash->trace_head : 0;
-	for (i = 0; i < count; i++) {
-		size_t pos = (start + i) % ASHEN_TRACE_LEN;
-		snap[i] = ash->trace_buf[pos];
-		dirs[i] = ash->trace_dir[pos];
-	}
-	ash->trace_active = false;
+	ash_trace_flush_locked(ash, &flags);
 	spin_unlock_irqrestore(&ash->trace_lock, flags);
-
-	dev_info(&ash->serdev->dev, "trace dump: %zu bytes\n", count);
-	/* Print in direction-grouped runs, 16 bytes per line, so TX and RX
-	 * are visually separable in the hex. */
-	i = 0;
-	while (i < count) {
-		char line[16 * 3 + 1];
-		char dir = dirs[i];
-		int off = 0;
-		run = 0;
-		while (i + run < count && dirs[i + run] == dir && run < 16) {
-			off += scnprintf(line + off, sizeof(line) - off,
-					"%02x ", snap[i + run]);
-			run++;
-		}
-		dev_info(&ash->serdev->dev, "  %c: %s\n", dir, line);
-		i += run;
-	}
+	return HRTIMER_NORESTART;
 }
 
 static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
@@ -232,7 +220,6 @@ static void ashen_restart_handshake(struct work_struct *w)
 	struct ashen_tamper *ash = container_of(w, struct ashen_tamper, restart_work);
 	static const u8 reset[ASHEN_TAMPER_RESET_LEN] = {0};
 	unsigned long flags;
-	ash_trace_arm(ash);
 	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
 	mutex_lock(&ash->rx_lock);
 	mutex_lock(&ash->tx_lock);
@@ -435,9 +422,13 @@ ash_restart_timer_fn(struct hrtimer *t)
 {
 	struct ashen_tamper *ash = container_of(t, struct ashen_tamper, restart_timer);
 
-	dev_warn_ratelimited(&ash->serdev->dev,
-			"handshake timed out, retrying\n");
-	ash_trace_dump(ash);
+	if (ash->conn_st != CONN_DISCONNECTED)
+		dev_warn_ratelimited(&ash->serdev->dev,
+				"handshake timed out, retrying\n");
+	/* Get any partial line out next to the warning above. The trace timer
+	 * shares this soft base, so it cannot be running concurrently. */
+	hrtimer_try_to_cancel(&ash->trace_timer);
+	ash_trace_timer_fn(&ash->trace_timer);
 	queue_work(ash->tx_wq, &ash->restart_work);
 	return HRTIMER_NORESTART;
 }
@@ -524,8 +515,11 @@ static ssize_t action_store(struct device *dev, struct device_attribute *attr,
 	if (sysfs_streq(buf, "erase")) {
 		msg = ASHEN_MSG_ERASE;
 		ret = ash_send_envelope(ash, &msg, sizeof(msg));
+		ash->conn_st = CONN_DISCONNECTED;
 		if (!ret)
-			queue_work(ash->tx_wq, &ash->restart_work);
+			hrtimer_start(&ash->restart_timer,
+					us_to_ktime(ASHEN_TAMPER_ERASE_DURATION_US),
+					HRTIMER_MODE_REL_SOFT);
 	} else if (sysfs_streq(buf, "pair")) {
 		msg = ASHEN_MSG_PAIR_REQUEST;
 		ret = ash_send_envelope(ash, &msg, sizeof(msg));
@@ -678,6 +672,8 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 			HRTIMER_MODE_REL_HARD);
 	hrtimer_setup(&ash->restart_timer, ash_restart_timer_fn, CLOCK_MONOTONIC,
 			HRTIMER_MODE_REL_SOFT);
+	hrtimer_setup(&ash->trace_timer, ash_trace_timer_fn, CLOCK_MONOTONIC,
+			HRTIMER_MODE_REL_SOFT);
 
 	ret = serdev_device_open(serdev);
 	if (ret) {
@@ -705,6 +701,7 @@ static void ashen_tamper_remove(struct serdev_device *serdev)
 	hrtimer_cancel(&ash->restart_timer);
 	hrtimer_cancel(&ash->refresh_timer);
 	hrtimer_cancel(&ash->hb_timer);
+	hrtimer_cancel(&ash->trace_timer);
 	cancel_work_sync(&ash->restart_work);
 	cancel_work_sync(&ash->tx_work);
 	serdev_device_close(serdev);

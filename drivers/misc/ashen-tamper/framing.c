@@ -54,10 +54,11 @@ size_t ashen_framer_push(struct ashen_framer *f, const u8 *buf, size_t size)
 		while (size && *buf == 0x00) {
 			buf++;
 			size--;
+			consumed++;
 			f->null_run ++;
 		}
 
-		if (size && f->null_run >= FRAMER_SYNC_NULLS) {
+		if (f->null_run >= FRAMER_SYNC_NULLS) {
 			f->sync = true;
 			f->on_reset(f->ctx);
 			break;
@@ -66,6 +67,7 @@ size_t ashen_framer_push(struct ashen_framer *f, const u8 *buf, size_t size)
 		while (size && *buf != 0x00) {
 			buf++;
 			size--;
+			consumed++;
 			f->null_run = 0;
 		}
 	}

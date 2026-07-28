@@ -7,6 +7,7 @@
 #ifndef __ASHEN_H__
 #define __ASHEN_H__
 
+#include <linux/hrtimer.h>
 #include <linux/kfifo.h>
 #include <linux/workqueue.h>
 #include "framing.h"
@@ -55,13 +56,14 @@ struct ashen_tamper {
 	struct mutex rx_lock;
 	unsigned char tx_buf[256];
 
-#define ASHEN_TRACE_LEN 8192
+	/* Hexdump of the wire, flushed a line at a time: on 16 bytes, on a
+	 * direction change, or 100 ms after the last byte. */
+#define ASHEN_TRACE_LINE 16
 	spinlock_t trace_lock;
-	bool trace_active;
-	size_t trace_head;
-	size_t trace_count;
-	u8 trace_buf[ASHEN_TRACE_LEN]; /* high bit of each byte = TX, low 8 held below */
-	u8 trace_dir[ASHEN_TRACE_LEN]; /* 'T' or 'R' */
+	struct hrtimer trace_timer;
+	char trace_dir; /* 'T', 'R', or 0 when the line buffer is empty */
+	size_t trace_len;
+	u8 trace_buf[ASHEN_TRACE_LINE];
 };
 
 #endif /* __ASHEN_H__ */

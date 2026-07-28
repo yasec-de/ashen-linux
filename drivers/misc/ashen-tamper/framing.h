@@ -9,7 +9,7 @@
 
 #include <linux/types.h>
 
-#define FRAMER_SYNC_NULLS 8
+#define FRAMER_SYNC_NULLS 24
 
 struct ashen_framer {
 	size_t rx_len;
