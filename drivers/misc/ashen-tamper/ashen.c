@@ -92,7 +92,7 @@ static enum hrtimer_restart ash_trace_timer_fn(struct hrtimer *t)
 	return HRTIMER_NORESTART;
 }
 
-static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
+static int ash_serdev_write(struct ashen_tamper *ash, const u8 *msg, size_t msg_len) {
 	ash_trace_bytes(ash, 'T', msg, msg_len);
 	if (msg_len == serdev_device_write(ash->serdev, msg, msg_len,
 			ASHEN_TAMPER_SERDEV_TIMEOUT)) {
@@ -100,7 +100,9 @@ static int ash_serdev_write(struct ashen_tamper *ash, u8 *msg, size_t msg_len) {
 	}
 	dev_err_ratelimited(&ash->serdev->dev,
 			"I/O error writing to serial\n");
-	queue_work(ash->tx_wq, &ash->restart_work);
+	/* Caller decides whether to restart: ashen_restart_handshake() queues
+	 * restart_work for this same failure, and a plain work_struct requeued
+	 * while running re-runs immediately. */
 	return -EIO;
 }
 
@@ -189,6 +191,7 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 		encoded = cobs_encode(hs_msg, to_write, wire, sizeof(wire));
 		if (encoded < 0 || ash_serdev_write(ash, wire, encoded)) {
 			mutex_unlock(&ash->tx_lock);
+			queue_work(ash->tx_wq, &ash->restart_work);
 			return;
 		}
 	}
@@ -243,12 +246,11 @@ static void ashen_restart_handshake(struct work_struct *w)
 	ash->noise_st.hs.loc_static = ash->loc_static;
 	ashen_framer_reset(ash->framer);
 
-	if (ash_serdev_write(ash, reset, sizeof(reset))) {
-		mutex_unlock(&ash->rx_lock);
-		mutex_unlock(&ash->tx_lock);
-		queue_work(ash->tx_wq, &ash->restart_work);
-		return;
-	}
+	/* on write failure fall through to the handshake timeout
+	 * rather than requeueing
+	 */
+	ash_serdev_write(ash, reset, sizeof(reset));
+
 	WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
 	hrtimer_start(&ash->restart_timer,
 			us_to_ktime(ASHEN_TAMPER_HS_TIMEOUT_US),
