@@ -271,8 +271,34 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 	switch (buf[0]) {
 	case ASHEN_MSG_LOG: {
 		const struct ashen_msg_log *msg = (const void *)buf;
-		/* msg->data, len - 1 bytes of defmt frame -- TODO */
-		(void)msg;
+		char *data = msg->data;
+		size_t dlen = len - 1;
+		const char *newline;
+
+		/* print complete lines */
+		while ((newline = memchr(data, '\n', dlen))) {
+			dev_info(&ash->serdev->dev, "[dev] %.*s%.*s\n",
+					(int)ash->log_buf_pos, ash->log_buf,
+					(int)(newline - data), data);
+			ash->log_buf_pos = 0;
+			dlen -= (newline - data) + 1;
+			data = newline + 1;
+		}
+
+		/* flush as long as we're overflowing log_buf */
+		while (ash->log_buf_pos + dlen > sizeof(ash->log_buf)) {
+			size_t print_size = sizeof(ash->log_buf) - ash->log_buf_pos;
+			dev_info(&ash->serdev->dev, "[dev] %.*s%.*s\\\n",
+					(int)ash->log_buf_pos, ash->log_buf,
+					(int)print_size, data);
+			data += print_size;
+			dlen -= print_size;
+			ash->log_buf_pos = 0;
+		}
+
+		/* store partial line for next time */
+		memcpy(ash->log_buf + ash->log_buf_pos, data, dlen);
+		ash->log_buf_pos += dlen;
 		break;
 	}
 	case ASHEN_MSG_PAIR_RESPONSE: {

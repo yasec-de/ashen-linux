@@ -56,6 +56,9 @@ struct ashen_tamper {
 	struct mutex rx_lock;
 	unsigned char tx_buf[256];
 
+	u8 log_buf[512];
+	size_t log_buf_pos;
+
 	/* Hexdump of the wire, flushed a line at a time: on 16 bytes, on a
 	 * direction change, or 100 ms after the last byte. */
 #define ASHEN_TRACE_LINE 16
