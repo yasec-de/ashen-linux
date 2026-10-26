@@ -21,6 +21,14 @@
 	};
 };
 
+/*
+ * The demo only needs the display (KMS) for the console; the Adreno GPU fails
+ * to initialise (-EINVAL) and its retries put errors on the console.
+ */
+&gpu {
+	status = "disabled";
+};
+
 &uart2 {
 	status = "okay";
 
