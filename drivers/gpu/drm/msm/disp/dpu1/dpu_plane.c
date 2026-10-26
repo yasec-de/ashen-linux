@@ -12,6 +12,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_uapi.h>
+#include <drm/drm_panic.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_framebuffer.h>
@@ -20,6 +21,7 @@
 #include <linux/soc/qcom/ubwc.h>
 
 #include "msm_drv.h"
+#include "msm_gem.h"
 #include "dpu_kms.h"
 #include "dpu_hw_sspp.h"
 #include "dpu_hw_util.h"
@@ -1799,11 +1801,38 @@ static const struct drm_plane_funcs dpu_plane_funcs = {
 		.format_mod_supported = dpu_plane_format_mod_supported,
 };
 
+static int dpu_plane_get_scanout_buffer(struct drm_plane *plane,
+					struct drm_scanout_buffer *sb)
+{
+	struct drm_framebuffer *fb = plane->state ? plane->state->fb : NULL;
+	struct msm_gem_object *msm_obj;
+
+	/* drm_panic can only draw into linear, uncompressed buffers */
+	if (!fb || fb->modifier != DRM_FORMAT_MOD_LINEAR || fb->format->num_planes != 1)
+		return -EOPNOTSUPP;
+
+	msm_obj = to_msm_bo(msm_framebuffer_bo(fb, 0));
+	if (msm_obj->vaddr) {
+		iosys_map_set_vaddr(&sb->map[0], msm_obj->vaddr + fb->offsets[0]);
+	} else if (msm_obj->pages && !fb->offsets[0]) {
+		sb->pages = msm_obj->pages;
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	sb->format = fb->format;
+	sb->width = fb->width;
+	sb->height = fb->height;
+	sb->pitch[0] = fb->pitches[0];
+	return 0;
+}
+
 static const struct drm_plane_helper_funcs dpu_plane_helper_funcs = {
 		.prepare_fb = dpu_plane_prepare_fb,
 		.cleanup_fb = dpu_plane_cleanup_fb,
 		.atomic_check = dpu_plane_atomic_check,
 		.atomic_update = dpu_plane_atomic_update,
+	.get_scanout_buffer = dpu_plane_get_scanout_buffer,
 };
 
 static const struct drm_plane_helper_funcs dpu_plane_virtual_helper_funcs = {
@@ -1811,6 +1840,7 @@ static const struct drm_plane_helper_funcs dpu_plane_virtual_helper_funcs = {
 	.cleanup_fb = dpu_plane_cleanup_fb,
 	.atomic_check = dpu_plane_atomic_check,
 	.atomic_update = dpu_plane_atomic_update,
+	.get_scanout_buffer = dpu_plane_get_scanout_buffer,
 };
 
 /* initialize plane */
