@@ -745,7 +745,7 @@ MODULE_DEVICE_TABLE(of, ashen_tamper_of_match);
 static enum hrtimer_restart
 ash_hb_timer_fn(struct hrtimer *t)
 {
-	panic("Timeout on ashen tamper alarm heartbeat link");
+	panic("TAMPER ALARM: tamper MCU heartbeat lost - wiping memory");
 	return HRTIMER_NORESTART; /* unreachable */
 }
 
