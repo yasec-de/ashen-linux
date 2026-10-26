@@ -435,6 +435,16 @@ static void ashen_tpm_open(struct ashen_tamper *ash)
 	spin_unlock_irqrestore(&t->rx_lock, flags);
 }
 
+/*
+ * Start sending echo requests and start the heartbeat deadline right away, so a
+ * device that never answers the first echo also trips the alarm.
+ */
+static void ash_arm_heartbeat(struct ashen_tamper *ash)
+{
+	hrtimer_start(&ash->hb_timer, ash->timeout, HRTIMER_MODE_REL_HARD);
+	hrtimer_start(&ash->refresh_timer, 0, HRTIMER_MODE_REL_HARD);
+}
+
 static void ashen_continue_handshake(struct ashen_tamper *ash,
 		const u8 *buf, size_t len)
 {
@@ -475,7 +485,7 @@ static void ashen_continue_handshake(struct ashen_tamper *ash,
 	complete_all(&ash->connection_ready);
 
 	if (ash->autostart)
-		hrtimer_start(&ash->refresh_timer, 0, HRTIMER_MODE_REL_HARD);
+		ash_arm_heartbeat(ash);
 
 	type = ASHEN_MSG_STATUS_REQUEST;
 	if (ash_send_envelope(ash, &type, sizeof(type)))
@@ -548,7 +558,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 
 		/* print complete lines */
 		while ((newline = memchr(data, '\n', dlen))) {
-			dev_info(&ash->serdev->dev, "[dev] %.*s%.*s\n",
+			dev_notice(&ash->serdev->dev, "fw: %.*s%.*s\n",
 					(int)ash->log_buf_pos, ash->log_buf,
 					(int)(newline - data), data);
 			ash->log_buf_pos = 0;
@@ -560,7 +570,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 		while (ash->log_buf_pos + dlen > sizeof(ash->log_buf)) {
 			size_t print_size = sizeof(ash->log_buf) - ash->log_buf_pos;
 
-			dev_info(&ash->serdev->dev, "[dev] %.*s%.*s\\\n",
+			dev_notice(&ash->serdev->dev, "fw: %.*s%.*s\\\n",
 					(int)ash->log_buf_pos, ash->log_buf,
 					(int)print_size, data);
 			data += print_size;
@@ -807,7 +817,7 @@ static ssize_t armed_store(struct device *dev, struct device_attribute *attr,
 	if (arm) {
 		if (ash->conn_st != CONN_CONNECTED)
 			return -ENOTCONN;
-		hrtimer_start(&ash->refresh_timer, 0, HRTIMER_MODE_REL_HARD);
+		ash_arm_heartbeat(ash);
 	} else {
 		hrtimer_cancel(&ash->refresh_timer);
 		hrtimer_cancel(&ash->hb_timer);
