@@ -6,6 +6,21 @@
 /dts-v1/;
 /plugin/;
 
+&tlmm {
+	/*
+	 * GPIO_37 drives the MCU's BOOT0 through a TXS0104 level shifter, whose
+	 * pull-ups win when the pin is undriven. Hold it low so every MCU reset
+	 * (tamper self-reset, SWD flashing) boots ashen-fw from flash instead of
+	 * the STM32 ROM bootloader.
+	 */
+	mcu-boot0-hog {
+		gpio-hog;
+		gpios = <37 0>;
+		output-low;
+		line-name = "MCU_BOOT0";
+	};
+};
+
 &uart2 {
 	status = "okay";
 
