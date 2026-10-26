@@ -1047,9 +1047,24 @@ static void ashen_tamper_remove(struct serdev_device *serdev)
 	destroy_workqueue(ash->tx_wq);
 }
 
+/*
+ * An orderly reboot or poweroff takes the UART down while the heartbeat timer
+ * keeps running, which would turn every shutdown into a tamper alarm (and run
+ * the crash payload against half-shut-down hardware). Disarm first.
+ */
+static void ashen_tamper_shutdown(struct serdev_device *serdev)
+{
+	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
+
+	hrtimer_cancel(&ash->refresh_timer);
+	hrtimer_cancel(&ash->hb_timer);
+	dev_info(&serdev->dev, "heartbeat disarmed for shutdown\n");
+}
+
 static struct serdev_device_driver ashen_tamper_driver = {
 	.probe = ashen_tamper_probe,
 	.remove = ashen_tamper_remove,
+	.shutdown = ashen_tamper_shutdown,
 	.driver = {
 		.name = "ashen-tamper",
 		.of_match_table = ashen_tamper_of_match,
