@@ -59,12 +59,19 @@ static bool ash_trace_flush_locked(struct ashen_tamper *ash, unsigned long *flag
 	return true;
 }
 
+static bool trace;
+module_param(trace, bool, 0644);
+MODULE_PARM_DESC(trace, "Log raw link bytes (very noisy once the heartbeat runs)");
+
 /* Called from IRQ context (RX) and process context (TX). */
 static void ash_trace_bytes(struct ashen_tamper *ash, char dir,
 		const u8 *buf, size_t len)
 {
 	unsigned long flags;
 	size_t i;
+
+	if (!READ_ONCE(trace))
+		return;
 
 	spin_lock_irqsave(&ash->trace_lock, flags);
 	for (i = 0; i < len; i++) {
