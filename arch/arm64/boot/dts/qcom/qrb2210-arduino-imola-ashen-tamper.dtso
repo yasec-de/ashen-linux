@@ -13,5 +13,7 @@
 		compatible = "ashen,hbv1";
 		timeout-us = <100000>;
 		refresh-ivl-us = <50000>;
+		/* armed from userspace once paired, see demo/ashen-pair */
+		no-autostart;
 	};
 };
