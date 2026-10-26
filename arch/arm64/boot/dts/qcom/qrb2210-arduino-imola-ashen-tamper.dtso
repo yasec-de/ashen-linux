@@ -29,6 +29,19 @@
 	status = "disabled";
 };
 
+/*
+ * No audio in the demo. The ADSP firmware fails to load, so the LPASS audio
+ * blocks only defer forever and print warnings onto the console.
+ */
+&remoteproc_adsp { status = "disabled"; };
+&sound { status = "disabled"; };
+&lpass_tlmm { status = "disabled"; };
+&rxmacro { status = "disabled"; };
+&txmacro { status = "disabled"; };
+&vamacro { status = "disabled"; };
+&swr0 { status = "disabled"; };
+&swr1 { status = "disabled"; };
+
 &uart2 {
 	status = "okay";
 
