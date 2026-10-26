@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Ashen tamper/heartbeat MCU link on the UNO Q's QRB2210<->STM32U585 UART.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&uart2 {
+	status = "okay";
+
+	tamper: tamper {
+		compatible = "ashen,hbv1";
+		timeout-us = <100000>;
+		refresh-ivl-us = <50000>;
+	};
+};
