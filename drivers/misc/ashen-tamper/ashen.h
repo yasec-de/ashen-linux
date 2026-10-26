@@ -7,11 +7,16 @@
 #ifndef __ASHEN_H__
 #define __ASHEN_H__
 
+#include <linux/auxiliary_bus.h>
+#include <linux/completion.h>
 #include <linux/hrtimer.h>
 #include <linux/kfifo.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include "framing.h"
 #include "noise.h"
+#include "proto.h"
 
 enum ashen_connstate {
 	CONN_DISCONNECTED,
@@ -26,6 +31,25 @@ enum ashen_connstate {
 struct ashen_tx_req {
 	u8 payload[ASHEN_TX_MAX_PAYLOAD];
 	size_t len;
+};
+
+struct ashen_tpm_xfer {
+	struct mutex lock;
+	spinlock_t rx_lock;
+	u8 *rsp;
+	size_t rsp_cap;
+	size_t rsp_len;
+	bool active;
+	bool overflow;
+	int result;
+	struct completion done;
+	unsigned int gen;
+	bool ready_set;
+	bool shutdown;
+	struct completion ready;
+	struct work_struct work;
+	struct auxiliary_device *adev;
+	u8 frag[2 + ASHEN_TPM_CHUNK_LEN];
 };
 
 struct ashen_tamper {
@@ -54,7 +78,10 @@ struct ashen_tamper {
 
 	struct mutex tx_lock;
 	struct mutex rx_lock;
-	unsigned char tx_buf[256];
+	unsigned char tx_buf[ASHEN_MAX_PAYLOAD_LEN];
+	u8 tx_wire[ASHEN_MAX_FRAME_LEN];
+
+	struct ashen_tpm_xfer tpm;
 
 	u8 log_buf[512];
 	size_t log_buf_pos;

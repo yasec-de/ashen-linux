@@ -20,7 +20,15 @@ enum ashen_msg_type {
 	ASHEN_MSG_DISCONNECT = 7,
 	ASHEN_MSG_ECHO_REQUEST = 8,
 	ASHEN_MSG_ECHO_RESPONSE = 9,
+	ASHEN_MSG_TPM_COMMAND = 10,
+	ASHEN_MSG_TPM_RESPONSE = 11,
 };
+
+#define ASHEN_MAX_PAYLOAD_LEN 512
+#define ASHEN_MAX_FRAME_LEN (ASHEN_MAX_PAYLOAD_LEN + ASHEN_MAX_PAYLOAD_LEN / 254 + 2)
+
+#define ASHEN_TPM_FLAG_MORE 0x01
+#define ASHEN_TPM_CHUNK_LEN (ASHEN_MAX_PAYLOAD_LEN - 16 - 2)
 
 /* Wire packet format */
 struct ashen_msg_log {
@@ -42,6 +50,12 @@ struct ashen_msg_status_response {
 struct ashen_msg_echo {
 	u8 type; /* ASHEN_MSG_ECHO_REQUEST or ASHEN_MSG_ECHO_RESPONSE */
 	__be64 value;
+} __packed;
+
+struct ashen_msg_tpm {
+	u8 type;
+	u8 flags;
+	u8 data[];
 } __packed;
 
 #endif /* _ASHEN_PROTO_H */

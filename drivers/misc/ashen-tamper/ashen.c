@@ -5,6 +5,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/ashen-tamper.h>
 #include <linux/hex.h>
 #include <linux/hrtimer.h>
 #include <linux/module.h>
@@ -12,20 +13,23 @@
 #include <linux/serdev.h>
 #include <linux/sysfs.h>
 #include <linux/overflow.h>
+#include <linux/tpm.h>
+#include <linux/unaligned.h>
 #include "cobs.h"
 #include "noise.h"
 #include "framing.h"
 #include "proto.h"
 #include "ashen.h"
 
-#define ASHEN_TAMPER_DEFAULT_BAUDRATE 1000000
+#define ASHEN_TAMPER_DEFAULT_BAUDRATE 4000000
 #define ASHEN_TAMPER_DEFAULT_TIMEOUT_US 10000
 #define ASHEN_TAMPER_DEFAULT_REFRESH_IVL_US 5000
 #define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
-#define ASHEN_TAMPER_RX_BUF_SIZE 256
+#define ASHEN_TAMPER_RX_BUF_SIZE ASHEN_MAX_FRAME_LEN
 #define ASHEN_TAMPER_HS_TIMEOUT_US 10000000
 #define ASHEN_TAMPER_ERASE_DURATION_US 250000
 #define ASHEN_TAMPER_RESET_LEN 32
+#define ASHEN_TPM_STARTUP_TIMEOUT_MS 5000
 
 
 #define ASHEN_TRACE_IDLE_MS 100
@@ -106,18 +110,49 @@ static int ash_serdev_write(struct ashen_tamper *ash, const u8 *msg, size_t msg_
 	return -EIO;
 }
 
-static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
+static int ash_tx_payload(struct ashen_tamper *ash, const u8 *payload,
+		size_t len)
 {
-	u8 wire[sizeof(ash->tx_buf) + 16];
 	ssize_t encoded;
-	size_t clen = req->len + NOISE_MAC_LEN;
-	noise_encrypt_transport_message(&ash->noise_st, req->payload, req->len,
+	size_t clen = len + NOISE_MAC_LEN;
+
+	if (clen > sizeof(ash->tx_buf))
+		return -EMSGSIZE;
+
+	noise_encrypt_transport_message(&ash->noise_st, payload, len,
 			ash->tx_buf);
-	encoded = cobs_encode(ash->tx_buf, clen, wire, sizeof(wire));
+	encoded = cobs_encode(ash->tx_buf, clen, ash->tx_wire,
+			sizeof(ash->tx_wire));
 	if (encoded < 0)
 		return -EMSGSIZE;
 
-	return ash_serdev_write(ash, wire, encoded);
+	return ash_serdev_write(ash, ash->tx_wire, encoded);
+}
+
+static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
+{
+	return ash_tx_payload(ash, req->payload, req->len);
+}
+
+static void ash_tx_drain_locked(struct ashen_tamper *ash)
+{
+	struct ashen_tx_req req;
+	unsigned long flags;
+	bool ok;
+
+	lockdep_assert_held(&ash->tx_lock);
+
+	for (;;) {
+		spin_lock_irqsave(&ash->tx_queue_lock, flags);
+		ok = kfifo_get(&ash->tx_queue, &req);
+		spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
+
+		if (!ok)
+			return;
+
+		if (ash_tx_one(ash, &req))
+			dev_err(&ash->serdev->dev, "I/O error during payload transmission\n");
+	}
 }
 
 static void ash_tx_work_fn(struct work_struct *w)
@@ -166,6 +201,235 @@ static int ash_send_envelope(struct ashen_tamper *ash,
 
 	queue_work(ash->tx_wq, &ash->tx_work);
 	return 0;
+}
+
+static void ashen_tpm_abort(struct ashen_tamper *ash, int err)
+{
+	struct ashen_tpm_xfer *t = &ash->tpm;
+	unsigned long flags;
+
+	spin_lock_irqsave(&t->rx_lock, flags);
+	t->gen++;
+	t->ready_set = false;
+	reinit_completion(&t->ready);
+	if (t->active) {
+		t->active = false;
+		t->result = err;
+		complete(&t->done);
+	}
+	spin_unlock_irqrestore(&t->rx_lock, flags);
+}
+
+static void ashen_tpm_receive(struct ashen_tamper *ash, bool more,
+		const u8 *data, size_t len)
+{
+	struct ashen_tpm_xfer *t = &ash->tpm;
+	unsigned long flags;
+
+	spin_lock_irqsave(&t->rx_lock, flags);
+	if (!t->active) {
+		spin_unlock_irqrestore(&t->rx_lock, flags);
+		dev_warn_ratelimited(&ash->serdev->dev,
+				"unexpected TPM response fragment\n");
+		return;
+	}
+
+	if (t->overflow || len > t->rsp_cap - t->rsp_len) {
+		t->overflow = true;
+	} else {
+		memcpy(t->rsp + t->rsp_len, data, len);
+		t->rsp_len += len;
+	}
+
+	if (!more) {
+		t->active = false;
+		complete(&t->done);
+	}
+	spin_unlock_irqrestore(&t->rx_lock, flags);
+}
+
+static int ashen_tpm_xfer(struct ashen_tamper *ash, u8 *buf, size_t bufsiz,
+		size_t cmd_len, unsigned long timeout, bool gated)
+{
+	struct ashen_tpm_xfer *t = &ash->tpm;
+	unsigned long flags;
+	size_t off = 0;
+	long left;
+	int ret = 0;
+
+	lockdep_assert_held(&t->lock);
+
+	spin_lock_irqsave(&t->rx_lock, flags);
+	if (gated && !t->ready_set) {
+		spin_unlock_irqrestore(&t->rx_lock, flags);
+		return -ENODEV;
+	}
+	t->rsp = buf;
+	t->rsp_cap = bufsiz;
+	t->rsp_len = 0;
+	t->overflow = false;
+	t->result = 0;
+	t->active = true;
+	reinit_completion(&t->done);
+	spin_unlock_irqrestore(&t->rx_lock, flags);
+
+	while (!ret) {
+		size_t n = min_t(size_t, cmd_len - off, ASHEN_TPM_CHUNK_LEN);
+
+		mutex_lock(&ash->tx_lock);
+		spin_lock_irqsave(&t->rx_lock, flags);
+		if (!t->active)
+			ret = t->result ?: -EIO;
+		else if (READ_ONCE(ash->conn_st) != CONN_CONNECTED)
+			ret = -ENOTCONN;
+		spin_unlock_irqrestore(&t->rx_lock, flags);
+
+		if (!ret) {
+			ash_tx_drain_locked(ash);
+			t->frag[0] = ASHEN_MSG_TPM_COMMAND;
+			t->frag[1] = off + n < cmd_len ? ASHEN_TPM_FLAG_MORE : 0;
+			memcpy(t->frag + 2, buf + off, n);
+			ret = ash_tx_payload(ash, t->frag, n + 2);
+		}
+		mutex_unlock(&ash->tx_lock);
+
+		off += n;
+		if (ret || off >= cmd_len)
+			break;
+
+		serdev_device_wait_until_sent(ash->serdev,
+				ASHEN_TAMPER_SERDEV_TIMEOUT);
+	}
+	memzero_explicit(t->frag, sizeof(t->frag));
+
+	if (ret) {
+		if (ret == -EIO || ret == -EMSGSIZE)
+			queue_work(ash->tx_wq, &ash->restart_work);
+		goto out;
+	}
+
+	left = wait_for_completion_killable_timeout(&t->done, timeout);
+	if (left <= 0) {
+		ret = left ? left : -ETIME;
+		dev_err(&ash->serdev->dev,
+				"TPM command did not complete (%d), restarting\n",
+				ret);
+		queue_work(ash->tx_wq, &ash->restart_work);
+		goto out;
+	}
+
+	spin_lock_irqsave(&t->rx_lock, flags);
+	if (t->result)
+		ret = t->result;
+	else if (t->overflow)
+		ret = -E2BIG;
+	else if (!t->rsp_len)
+		ret = -EIO;
+	else
+		ret = t->rsp_len;
+	t->rsp = NULL;
+	spin_unlock_irqrestore(&t->rx_lock, flags);
+
+	if (ret == -EIO && cmd_len > ASHEN_TPM_CHUNK_LEN)
+		queue_work(ash->tx_wq, &ash->restart_work);
+	return ret;
+
+out:
+	spin_lock_irqsave(&t->rx_lock, flags);
+	t->active = false;
+	t->rsp = NULL;
+	spin_unlock_irqrestore(&t->rx_lock, flags);
+	return ret;
+}
+
+int ashen_tpm_transact(struct ashen_tamper *ash, u8 *buf, size_t bufsiz,
+		size_t cmd_len, unsigned long timeout)
+{
+	struct ashen_tpm_xfer *t = &ash->tpm;
+	long left;
+	int ret;
+
+	left = wait_for_completion_killable_timeout(&t->ready, timeout);
+	if (left < 0)
+		return left;
+	if (!left)
+		return -ENODEV;
+
+	mutex_lock(&t->lock);
+	ret = ashen_tpm_xfer(ash, buf, bufsiz, cmd_len, timeout, true);
+	mutex_unlock(&t->lock);
+	return ret;
+}
+EXPORT_SYMBOL_NS_GPL(ashen_tpm_transact, "ASHEN_TAMPER");
+
+static void ashen_tpm_work_fn(struct work_struct *w)
+{
+	struct ashen_tamper *ash = container_of(w, struct ashen_tamper, tpm.work);
+	struct ashen_tpm_xfer *t = &ash->tpm;
+	u8 buf[TPM_HEADER_SIZE + 2];
+	unsigned long flags;
+	unsigned int gen;
+	bool opened;
+	u32 rc;
+	int ret;
+
+	spin_lock_irqsave(&t->rx_lock, flags);
+	gen = t->gen;
+	spin_unlock_irqrestore(&t->rx_lock, flags);
+
+	put_unaligned_be16(TPM2_ST_NO_SESSIONS, buf);
+	put_unaligned_be32(sizeof(buf), buf + 2);
+	put_unaligned_be32(TPM2_CC_STARTUP, buf + 6);
+	put_unaligned_be16(TPM2_SU_CLEAR, buf + TPM_HEADER_SIZE);
+
+	mutex_lock(&t->lock);
+	ret = ashen_tpm_xfer(ash, buf, sizeof(buf), sizeof(buf),
+			msecs_to_jiffies(ASHEN_TPM_STARTUP_TIMEOUT_MS), false);
+	mutex_unlock(&t->lock);
+
+	if (ret < 0) {
+		dev_err(&ash->serdev->dev, "TPM2_Startup failed: %d\n", ret);
+		return;
+	}
+	if (ret < TPM_HEADER_SIZE) {
+		dev_err(&ash->serdev->dev, "TPM2_Startup: short response\n");
+		return;
+	}
+
+	rc = get_unaligned_be32(buf + 6);
+	if (rc != TPM2_RC_SUCCESS && rc != TPM2_RC_INITIALIZE) {
+		dev_err(&ash->serdev->dev, "TPM2_Startup returned 0x%x\n", rc);
+		return;
+	}
+
+	spin_lock_irqsave(&t->rx_lock, flags);
+	opened = t->gen == gen;
+	if (opened) {
+		t->ready_set = true;
+		complete_all(&t->ready);
+	}
+	spin_unlock_irqrestore(&t->rx_lock, flags);
+
+	if (!opened || t->adev)
+		return;
+
+	dev_info(&ash->serdev->dev, "registering TPM\n");
+
+	t->adev = auxiliary_device_create(&ash->serdev->dev, KBUILD_MODNAME,
+			"tpm", ash, ash->serdev->ctrl->nr);
+	if (!t->adev)
+		dev_err(&ash->serdev->dev, "unable to create TPM device\n");
+}
+
+static void ashen_tpm_open(struct ashen_tamper *ash)
+{
+	struct ashen_tpm_xfer *t = &ash->tpm;
+	unsigned long flags;
+
+	spin_lock_irqsave(&t->rx_lock, flags);
+	if (!t->ready_set && !t->shutdown)
+		queue_work(system_long_wq, &t->work);
+	spin_unlock_irqrestore(&t->rx_lock, flags);
 }
 
 static void ashen_continue_handshake(struct ashen_tamper *ash,
@@ -224,6 +488,7 @@ static void ashen_restart_handshake(struct work_struct *w)
 	static const u8 reset[ASHEN_TAMPER_RESET_LEN] = {0};
 	unsigned long flags;
 	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+	ashen_tpm_abort(ash, -ECONNRESET);
 	mutex_lock(&ash->rx_lock);
 	mutex_lock(&ash->tx_lock);
 	if (hrtimer_active(&ash->refresh_timer)) {
@@ -331,6 +596,17 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 		dev_info(&ash->serdev->dev,
 				"status: peer_trusted=%d is_keyed=%d\n",
 				msg->peer_trusted, msg->is_keyed);
+		if (msg->peer_trusted)
+			ashen_tpm_open(ash);
+		break;
+	}
+	case ASHEN_MSG_TPM_RESPONSE: {
+		const struct ashen_msg_tpm *msg = (const void *)buf;
+
+		if (len < sizeof(*msg) || (msg->flags & ~ASHEN_TPM_FLAG_MORE))
+			goto malformed;
+		ashen_tpm_receive(ash, msg->flags & ASHEN_TPM_FLAG_MORE,
+				msg->data, len - sizeof(*msg));
 		break;
 	}
 	case ASHEN_MSG_ECHO_RESPONSE: {
@@ -357,6 +633,7 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 		
 		dev_warn(&ash->serdev->dev, "device asked to disconnect, disarming heartbeat\n");
 		WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+		ashen_tpm_abort(ash, -ECONNRESET);
 		hrtimer_cancel(&ash->refresh_timer);
 		hrtimer_cancel(&ash->hb_timer);
 		reinit_completion(&ash->connection_ready);
@@ -544,6 +821,7 @@ static ssize_t action_store(struct device *dev, struct device_attribute *attr,
 		msg = ASHEN_MSG_ERASE;
 		ret = ash_send_envelope(ash, &msg, sizeof(msg));
 		ash->conn_st = CONN_DISCONNECTED;
+		ashen_tpm_abort(ash, -ECONNRESET);
 		if (!ret)
 			hrtimer_start(&ash->restart_timer,
 					us_to_ktime(ASHEN_TAMPER_ERASE_DURATION_US),
@@ -683,6 +961,12 @@ static int ashen_tamper_probe(struct serdev_device *serdev)
 	mutex_init(&ash->tx_lock);
 	mutex_init(&ash->rx_lock);
 
+	mutex_init(&ash->tpm.lock);
+	spin_lock_init(&ash->tpm.rx_lock);
+	init_completion(&ash->tpm.done);
+	init_completion(&ash->tpm.ready);
+	INIT_WORK(&ash->tpm.work, ashen_tpm_work_fn);
+
 	spin_lock_init(&ash->tx_queue_lock);
 	spin_lock_init(&ash->trace_lock);
 	INIT_KFIFO(ash->tx_queue);
@@ -724,7 +1008,17 @@ error:
 static void ashen_tamper_remove(struct serdev_device *serdev)
 {
 	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ash->tpm.rx_lock, flags);
+	ash->tpm.shutdown = true;
+	spin_unlock_irqrestore(&ash->tpm.rx_lock, flags);
+	cancel_work_sync(&ash->tpm.work);
+	if (ash->tpm.adev)
+		auxiliary_device_destroy(ash->tpm.adev);
+
 	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+	ashen_tpm_abort(ash, -ENODEV);
 
 	hrtimer_cancel(&ash->restart_timer);
 	hrtimer_cancel(&ash->refresh_timer);
