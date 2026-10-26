@@ -30,10 +30,13 @@
 };
 
 /*
- * No audio in the demo. The ADSP firmware fails to load, so the LPASS audio
- * blocks only defer forever and print warnings onto the console.
+ * No audio or video codec in the demo. The ADSP firmware fails to load, so the
+ * LPASS audio blocks only defer forever and print warnings onto the console;
+ * venus fails on its firmware too. The ADSP itself stays: with it disabled the
+ * modem stalls during its own initialisation and crashes.
  */
-&remoteproc_adsp { status = "disabled"; };
+&venus { status = "disabled"; };
+&pmic4125_codec { status = "disabled"; };
 &sound { status = "disabled"; };
 &lpass_tlmm { status = "disabled"; };
 &rxmacro { status = "disabled"; };
