@@ -32,10 +32,21 @@
 /*
  * No audio or video codec in the demo. The ADSP firmware fails to load, so the
  * LPASS audio blocks only defer forever and print warnings onto the console;
- * venus fails on its firmware too. The ADSP itself stays: with it disabled the
- * modem stalls during its own initialisation and crashes.
+ * venus fails on its firmware too (QHEE did its PIL memory assignment as well).
  */
 &venus { status = "disabled"; };
+
+/*
+ * Linux runs at EL2 here (QHEE is torn down for KVM), so nothing does QHEE's PIL
+ * work anymore (SHM bridges, mapping the carveout for the subsystem's SMMU
+ * stream): the ADSP's PAS INIT_IMAGE then fails with -EINVAL. With the ADSP's
+ * firmware stream ID given, qcom_q6v5_pas does that work itself, as in the
+ * upstream *-el2.dtso overlays. 0x1c0 is the base of agatti's LPASS SID block
+ * (q6asm uses 0x1c1, the fastrpc compute banks 0x1c3 and up).
+ */
+&remoteproc_adsp {
+	iommus = <&apps_smmu 0x1c0 0x0>;
+};
 &pmic4125_codec { status = "disabled"; };
 &sound { status = "disabled"; };
 &lpass_tlmm { status = "disabled"; };
