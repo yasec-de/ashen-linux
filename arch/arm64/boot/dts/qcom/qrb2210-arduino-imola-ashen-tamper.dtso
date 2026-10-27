@@ -43,9 +43,13 @@
  * firmware stream ID given, qcom_q6v5_pas does that work itself, as in the
  * upstream *-el2.dtso overlays. 0x1c0 is the base of agatti's LPASS SID block
  * (q6asm uses 0x1c1, the fastrpc compute banks 0x1c3 and up).
+ * Authentication then passes, but the ADSP never signals ready (no SMMU faults,
+ * hyp-assigning the carveout to VMIDs 6/0x16 does not help either), so it stays
+ * off: the demo has no audio, and the boot saves the 5 s start timeout.
  */
 &remoteproc_adsp {
 	iommus = <&apps_smmu 0x1c0 0x0>;
+	status = "disabled";
 };
 &pmic4125_codec { status = "disabled"; };
 &sound { status = "disabled"; };
