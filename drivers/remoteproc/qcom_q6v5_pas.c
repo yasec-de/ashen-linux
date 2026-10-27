@@ -277,6 +277,51 @@ static int qcom_pas_map_carveout(struct rproc *rproc, phys_addr_t mem_phys, size
 	return ret;
 }
 
+/*
+ * Without a hypervisor and without GET_RSCTABLE from TrustZone, nobody tells us what else the
+ * subsystem's stream may reach (shared memory, its own registers). qcom,iommu-static-map lists
+ * it as <iova pa size prot> (prot: 1 read, 2 write, 4 device memory, 8 cacheable).
+ */
+static int qcom_pas_static_map(struct rproc *rproc, bool map)
+{
+	struct qcom_pas *pas = rproc->priv;
+	struct device_node *np = pas->dev->of_node;
+	int i, n, ret = 0;
+
+	if (!rproc->has_iommu)
+		return 0;
+	n = of_property_count_u32_elems(np, "qcom,iommu-static-map");
+	if (n <= 0)
+		return 0;
+	for (i = 0; i + 4 <= n; i += 4) {
+		u32 iova, pa, size, flags;
+		int prot = IOMMU_NOEXEC;
+
+		of_property_read_u32_index(np, "qcom,iommu-static-map", i, &iova);
+		of_property_read_u32_index(np, "qcom,iommu-static-map", i + 1, &pa);
+		of_property_read_u32_index(np, "qcom,iommu-static-map", i + 2, &size);
+		of_property_read_u32_index(np, "qcom,iommu-static-map", i + 3, &flags);
+		if (!map) {
+			iommu_unmap(rproc->domain, iova, size);
+			continue;
+		}
+		prot |= (flags & 1 ? IOMMU_READ : 0) | (flags & 2 ? IOMMU_WRITE : 0) |
+			(flags & 4 ? IOMMU_MMIO : 0) | (flags & 8 ? IOMMU_CACHE : 0);
+		ret = iommu_map(rproc->domain, iova, pa, size, prot, GFP_KERNEL);
+		if (ret) {
+			dev_err(pas->dev, "static map 0x%x -> 0x%x (0x%x) failed: %d\n",
+				iova, pa, size, ret);
+			while ((i -= 4) >= 0) {
+				of_property_read_u32_index(np, "qcom,iommu-static-map", i, &iova);
+				of_property_read_u32_index(np, "qcom,iommu-static-map", i + 2, &size);
+				iommu_unmap(rproc->domain, iova, size);
+			}
+			return ret;
+		}
+	}
+	return 0;
+}
+
 static int qcom_pas_start(struct rproc *rproc)
 {
 	struct qcom_pas *pas = rproc->priv;
@@ -334,6 +379,10 @@ static int qcom_pas_start(struct rproc *rproc)
 	if (ret)
 		goto release_pas_metadata;
 
+	ret = qcom_pas_static_map(rproc, true);
+	if (ret)
+		goto unmap_carveout;
+
 	ret = qcom_pas_prepare_and_auth_reset(pas->pas_ctx);
 	if (ret) {
 		dev_err(pas->dev,
@@ -358,6 +407,7 @@ static int qcom_pas_start(struct rproc *rproc)
 	return 0;
 
 unmap_carveout:
+	qcom_pas_static_map(rproc, false);
 	qcom_pas_unmap_carveout(rproc, pas->mem_phys, pas->mem_size);
 release_pas_metadata:
 	qcom_pas_metadata_release(pas->pas_ctx);
@@ -430,6 +480,7 @@ static int qcom_pas_stop(struct rproc *rproc)
 		qcom_pas_unmap_carveout(rproc, pas->dtb_mem_phys, pas->dtb_mem_size);
 	}
 
+	qcom_pas_static_map(rproc, false);
 	qcom_pas_unmap_carveout(rproc, pas->mem_phys, pas->mem_size);
 
 	handover = qcom_q6v5_unprepare(&pas->q6v5);
