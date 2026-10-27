@@ -644,6 +644,14 @@ static void ashen_handle_packet(struct ashen_tamper *ash,
 		}
 		break;
 	}
+	case ASHEN_MSG_TAMPER:
+		if (len != 1)
+			goto malformed;
+		/* Unarmed means nothing is unlocked yet (or we're shutting down). */
+		if (hrtimer_active(&ash->hb_timer))
+			panic("TAMPER ALARM: tamper MCU reported tamper - wiping memory");
+		dev_crit(&ash->serdev->dev, "device reported tamper while disarmed\n");
+		break;
 	case ASHEN_MSG_DISCONNECT:
 		if (len != 1)
 			goto malformed;
