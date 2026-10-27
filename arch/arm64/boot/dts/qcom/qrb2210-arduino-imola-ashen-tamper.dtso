@@ -71,3 +71,13 @@
 		no-autostart;
 	};
 };
+
+/*
+ * The USB-C port only ever sinks power and the demo dock (a self-powered
+ * hub with Ethernet) never attaches, so the anx7625 leaves dwc3 in device
+ * mode. Run it host-only; build.sh also drops usb-role-switch, which an
+ * overlay cannot delete, or anx7625 would defer waiting for the switch.
+ */
+&usb_dwc3 {
+	dr_mode = "host";
+};
