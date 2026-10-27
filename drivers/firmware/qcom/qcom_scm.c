@@ -783,6 +783,11 @@ static void *qcom_scm_pas_get_rsc_table(struct device *dev,
 	void *tbl_ptr;
 	int ret;
 
+	/* Older TrustZone (e.g. QCM2290) predates this call. */
+	if (!__qcom_scm_is_call_available(dev, QCOM_SCM_SVC_PIL,
+					  QCOM_SCM_PIL_PAS_GET_RSCTABLE))
+		return ERR_PTR(-EOPNOTSUPP);
+
 	ret = qcom_scm_clk_enable();
 	if (ret)
 		return ERR_PTR(ret);
