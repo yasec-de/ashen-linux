@@ -9,9 +9,11 @@
 
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/elf.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -123,6 +125,8 @@ struct qcom_pas {
 
 	struct qcom_pas_context *pas_ctx;
 	struct qcom_pas_context *dtb_pas_ctx;
+
+	void __iomem *q6ss[8];
 };
 
 static void qcom_pas_segment_dump(struct rproc *rproc,
@@ -322,6 +326,133 @@ static int qcom_pas_static_map(struct rproc *rproc, bool map)
 	return 0;
 }
 
+/*
+ * On agatti, TrustZone's auth_and_reset leaves the LPASS Q6 stopped: the stock hypervisor (QHEE)
+ * clocks and starts it afterwards, and halts and resets it after shutdown. Without QHEE, Linux
+ * does both, with the register sequences of QHEE's LPASS PIL handlers.
+ */
+enum { Q6SS, Q6SS_CC, Q6SS_CFG, Q6SS_CSR, Q6SS_TBU, Q6SS_HALT, Q6SS_GCC, Q6SS_GCC_BCR };
+static const char * const qcom_pas_q6ss_names[] = {
+	"qdsp6ss", "lpass-cc", "lpass-cfg", "lpass-csr", "lpass-tbu", "halt", "gcc", "gcc-bcr",
+};
+
+static int qcom_pas_q6ss_rmw(void __iomem *reg, u32 clr, u32 set, u32 mask, u32 want, u32 us)
+{
+	u32 val;
+
+	writel((readl(reg) & ~clr) | set, reg);
+	if (!mask)
+		return 0;
+	return readl_poll_timeout(reg, val, (val & mask) == want, 5, us);
+}
+
+static int qcom_pas_q6ss_boot(struct qcom_pas *pas)
+{
+	void __iomem **r = pas->q6ss;
+	u32 q6ss_18, val;
+	phys_addr_t entry;
+	int ret;
+
+	ret = qcom_pas_q6ss_rmw(r[Q6SS_GCC] + 0xc, 0, BIT(0), BIT(31), 0, 500) ?:
+	      qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x901c, 0, BIT(0), BIT(31), 0, 500) ?:
+	      qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x9020, 0, BIT(0), BIT(31), 0, 500);
+	if (ret)
+		return ret;
+	q6ss_18 = readl(r[Q6SS] + 0x18);
+	qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x3090, 0, 0xf000, 0, 0, 0);
+	ret = qcom_pas_q6ss_rmw(r[Q6SS_GCC] + 0x8, 0, BIT(0), BIT(31), 0, 500);
+	if (ret)
+		return ret;
+	qcom_pas_q6ss_rmw(r[Q6SS] + 0x38, 0, BIT(0), 0, 0, 0);
+	qcom_pas_q6ss_rmw(r[Q6SS] + 0x3c, 0, BIT(0), 0, 0, 0);
+	qcom_pas_q6ss_rmw(r[Q6SS] + 0x20, 0, BIT(0), 0, 0, 0);
+	writel(q6ss_18, r[Q6SS] + 0x18);
+	if (q6ss_18) {
+		qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0xa00c, 0, BIT(0), 0, 0, 0);
+		qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0xa014, 0, BIT(0), 0, 0, 0);
+	}
+	qcom_pas_q6ss_rmw(r[Q6SS_CSR] + 0x5018, 0, BIT(2), 0, 0, 0);
+	ret = qcom_pas_q6ss_rmw(r[Q6SS_CSR] + 0x5020, 0, BIT(2), BIT(0), BIT(0), 5000);
+	if (ret)
+		return ret;
+
+	/* boot address: the ELF entry, relocated into the carveout */
+	entry = pas->mem_phys + ((const struct elf32_hdr *)pas->firmware->data)->e_entry -
+		pas->mem_reloc;
+	writel(1, r[Q6SS_CSR] + 0xb000);
+	val = readl(r[Q6SS_CSR] + 0xb004);
+	writel(((entry >> 4) & 0xffffff0) | (val & 0xf), r[Q6SS_CSR] + 0xb004);
+
+	qcom_pas_q6ss_rmw(r[Q6SS] + 0x400, 0, BIT(0), 0, 0, 0);
+	writel(1, r[Q6SS] + 0x404);
+	return readl_poll_timeout(r[Q6SS] + 0x408, val, val, 5, USEC_PER_SEC);
+}
+
+static void qcom_pas_q6ss_halt(struct qcom_pas *pas)
+{
+	void __iomem **r = pas->q6ss;
+	int i, ret;
+	u32 val;
+
+	qcom_pas_q6ss_rmw(r[Q6SS] + 0x1c, 0, BIT(0), 0, 0, 0);
+	ret = qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x9090, BIT(0), 0, BIT(31), BIT(31), 10000);
+	if (ret)
+		goto err;
+	qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x908c, 0, BIT(0), BIT(0), BIT(0), 500);
+	udelay(150);
+	qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x908c, BIT(0), 0, 0, 0, 0);
+	udelay(150);
+	for (i = 0; i < 3; i++)
+		qcom_pas_q6ss_rmw(r[Q6SS_CFG] + 0x3e8, BIT(i), 0, 0, 0, 0);
+	for (i = 0; i < 3; i++)
+		qcom_pas_q6ss_rmw(r[Q6SS_CFG], BIT(i), 0, 0, 0, 0);
+	ret = qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x9090, 0, BIT(0), BIT(31), 0, 500);
+	if (ret)
+		goto err;
+	if (!(readl(r[Q6SS_CC] + 0x16090) & BIT(31))) {
+		ret = qcom_pas_q6ss_rmw(r[Q6SS_CC] + 0x16090, BIT(0), 0, BIT(31), BIT(31), 500) ?:
+		      readl_poll_timeout(r[Q6SS_CC] + 0x1609c, val, val & BIT(0), 5, 500) ?:
+		      readl_poll_timeout(r[Q6SS_TBU] + 0x4, val, !(val & BIT(31)), 5, 500);
+		if (ret)
+			goto err;
+	}
+
+	/* halt the AXI port, pulse the block reset */
+	writel(1, r[Q6SS_HALT]);
+	ret = readl_poll_timeout(r[Q6SS_HALT] + 0x4, val, val & BIT(0), 5, USEC_PER_SEC);
+	if (ret)
+		dev_warn(pas->dev, "no halt ack, idle %#x\n", readl(r[Q6SS_HALT] + 0x8));
+	qcom_pas_q6ss_rmw(r[Q6SS_GCC_BCR], 0, BIT(0), 0, 0, 0);
+	udelay(200);
+	writel(0, r[Q6SS_GCC_BCR]);
+	writel(0, r[Q6SS_HALT]);
+	udelay(100);
+	return;
+err:
+	dev_err(pas->dev, "Q6 halt failed: %d\n", ret);
+}
+
+static int qcom_pas_q6ss_init(struct qcom_pas *pas)
+{
+	struct platform_device *pdev = to_platform_device(pas->dev);
+	struct resource *res;
+	int i;
+
+	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, qcom_pas_q6ss_names[0]))
+		return 0;
+	/* not requested: the GCC registers sit inside the clock controller's region */
+	for (i = 0; i < ARRAY_SIZE(qcom_pas_q6ss_names); i++) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, qcom_pas_q6ss_names[i]);
+		if (!res)
+			return dev_err_probe(pas->dev, -EINVAL, "missing reg %s\n",
+					     qcom_pas_q6ss_names[i]);
+		pas->q6ss[i] = devm_ioremap(pas->dev, res->start, resource_size(res));
+		if (!pas->q6ss[i])
+			return -ENOMEM;
+	}
+	return 0;
+}
+
 static int qcom_pas_start(struct rproc *rproc)
 {
 	struct qcom_pas *pas = rproc->priv;
@@ -390,10 +521,22 @@ static int qcom_pas_start(struct rproc *rproc)
 		goto unmap_carveout;
 	}
 
+	if (pas->q6ss[Q6SS]) {
+		ret = qcom_pas_q6ss_boot(pas);
+		if (ret) {
+			dev_err(pas->dev, "failed to start the Q6: %d\n", ret);
+			qcom_pas_shutdown(pas->pas_id);
+			qcom_pas_q6ss_halt(pas);
+			goto unmap_carveout;
+		}
+	}
+
 	ret = qcom_q6v5_wait_for_start(&pas->q6v5, msecs_to_jiffies(5000));
 	if (ret == -ETIMEDOUT) {
 		dev_err(pas->dev, "start timed out\n");
 		qcom_pas_shutdown(pas->pas_id);
+		if (pas->q6ss[Q6SS])
+			qcom_pas_q6ss_halt(pas);
 		goto unmap_carveout;
 	}
 
@@ -468,6 +611,8 @@ static int qcom_pas_stop(struct rproc *rproc)
 
 	if (ret)
 		dev_err(pas->dev, "failed to shutdown: %d\n", ret);
+	if (pas->q6ss[Q6SS])
+		qcom_pas_q6ss_halt(pas);
 
 	if (pas->dtb_pas_id) {
 		dtb_ret = qcom_pas_shutdown(pas->dtb_pas_id);
@@ -956,6 +1101,10 @@ static int qcom_pas_probe(struct platform_device *pdev)
 		goto free_rproc;
 
 	ret = qcom_pas_init_clock(pas);
+	if (ret)
+		goto unassign_mem;
+
+	ret = qcom_pas_q6ss_init(pas);
 	if (ret)
 		goto unassign_mem;
 
