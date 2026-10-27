@@ -43,11 +43,21 @@
  * firmware stream ID given, qcom_q6v5_pas does that work itself, as in the
  * upstream *-el2.dtso overlays. 0x1c0 is the base of agatti's LPASS SID block
  * (q6asm uses 0x1c1, the fastrpc compute banks 0x1c3 and up).
- * Authentication then passes, but the ADSP never signals ready (no SMMU faults,
- * hyp-assigning the carveout to VMIDs 6/0x16 does not help either), so it stays
- * off: the demo has no audio, and the boot saves the 5 s start timeout.
+ * QHEE also clocks and starts the Q6 after TrustZone's auth_and_reset, and halts it
+ * after shutdown; qcom_q6v5_pas does that when given these registers.
  */
 &remoteproc_adsp {
+	reg = <0x0 0x0ab00000 0x0 0x100>,
+	      <0x0 0x0a400000 0x0 0x1000>,
+	      <0x0 0x0a780000 0x0 0x20000>,
+	      <0x0 0x0a540000 0x0 0x1000>,
+	      <0x0 0x0a950000 0x0 0x10000>,
+	      <0x0 0x0ac02000 0x0 0x1000>,
+	      <0x0 0x00362000 0x0 0x10>,
+	      <0x0 0x0143a000 0x0 0x10>,
+	      <0x0 0x014c0000 0x0 0x4>;
+	reg-names = "base", "qdsp6ss", "lpass-cc", "lpass-cfg", "lpass-csr", "lpass-tbu",
+		    "halt", "gcc", "gcc-bcr";
 	iommus = <&apps_smmu 0x1c0 0x0>;
 	/*
 	 * What QHEE's stage 2 gave the ADSP Q6 (SID 0x1c0, VMID 6) besides its firmware,
