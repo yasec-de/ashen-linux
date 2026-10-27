@@ -349,6 +349,13 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 	size_t len = skb->len;
 	int rc, confirm_rx;
 
+	/* The remote may greet us before the say_hello work has run; the NS then
+	 * answers right away (announcing its servers), and dropping that answer
+	 * would lose it for good. Send our pending HELLO first.
+	 */
+	if (type != QRTR_TYPE_HELLO && !READ_ONCE(node->hello_sent))
+		flush_delayed_work(&node->say_hello);
+
 	mutex_lock(&node->ep_lock);
 	if (!node->hello_sent && type != QRTR_TYPE_HELLO) {
 		mutex_unlock(&node->ep_lock);
@@ -389,7 +396,7 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 		else
 			kfree_skb(skb);
 		if (!rc && type == QRTR_TYPE_HELLO)
-			node->hello_sent = true;
+			WRITE_ONCE(node->hello_sent, true);
 		mutex_unlock(&node->ep_lock);
 	}
 	/* Need to ensure that a subsequent message carries the otherwise lost
