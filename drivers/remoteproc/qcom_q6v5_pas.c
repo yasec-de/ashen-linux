@@ -499,6 +499,15 @@ static int qcom_pas_parse_firmware(struct rproc *rproc, const struct firmware *f
 	 */
 	output_rt = qcom_pas_get_rsc_table(pas->pas_ctx, table, table_sz, &output_rt_size);
 	ret = IS_ERR(output_rt) ? PTR_ERR(output_rt) : 0;
+	if (ret == -EOPNOTSUPP) {
+		/*
+		 * The firmware cannot hand out a resource table, so there are no
+		 * dynamic resources to set up: rely on the one embedded in the
+		 * remote processor firmware, if any, and the mapped carveout.
+		 */
+		dev_info(pas->dev, "no resource table from TrustZone, using firmware's\n");
+		return 0;
+	}
 	if (ret) {
 		dev_err(pas->dev, "Error in getting resource table: %d\n", ret);
 		return ret;
