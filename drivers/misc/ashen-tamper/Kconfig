@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Ashen Tamper Alarm Driver
+#
+
+config ASHEN_TAMPER
+	tristate "Ashen Sensor Heartbeat Protocol Support"
+	select CRYPTO_LIB_CURVE25519
+	select CRYPTO_LIB_CHACHA20POLY1305
+	select CRYPTO_LIB_SHA256
+	help
+	  Driver for the Ashen tamper monitor, a microcontroller attached over
+	  a UART that watches tamper sensors. The driver keeps an encrypted
+	  Noise_XX link to the monitor and exchanges heartbeats with it. When
+	  the monitor reports tamper or stops answering while the heartbeat is
+	  armed, the driver panics the kernel so that a crash kernel can wipe
+	  memory.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called ashen-tamper.
