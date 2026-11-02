@@ -316,8 +316,10 @@ static int qcom_pas_static_map(struct rproc *rproc, bool map)
 			dev_err(pas->dev, "static map 0x%x -> 0x%x (0x%x) failed: %d\n",
 				iova, pa, size, ret);
 			while ((i -= 4) >= 0) {
-				of_property_read_u32_index(np, "qcom,iommu-static-map", i, &iova);
-				of_property_read_u32_index(np, "qcom,iommu-static-map", i + 2, &size);
+				of_property_read_u32_index(np, "qcom,iommu-static-map",
+							   i, &iova);
+				of_property_read_u32_index(np, "qcom,iommu-static-map",
+							   i + 2, &size);
 				iommu_unmap(rproc->domain, iova, size);
 			}
 			return ret;
