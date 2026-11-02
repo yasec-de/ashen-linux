@@ -1812,13 +1812,12 @@ static int dpu_plane_get_scanout_buffer(struct drm_plane *plane,
 		return -EOPNOTSUPP;
 
 	msm_obj = to_msm_bo(msm_framebuffer_bo(fb, 0));
-	if (msm_obj->vaddr) {
+	if (msm_obj->vaddr)
 		iosys_map_set_vaddr(&sb->map[0], msm_obj->vaddr + fb->offsets[0]);
-	} else if (msm_obj->pages && !fb->offsets[0]) {
+	else if (msm_obj->pages && !fb->offsets[0])
 		sb->pages = msm_obj->pages;
-	} else {
+	else
 		return -EOPNOTSUPP;
-	}
 
 	sb->format = fb->format;
 	sb->width = fb->width;
