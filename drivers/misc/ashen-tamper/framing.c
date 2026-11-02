@@ -30,16 +30,17 @@ static size_t ashen_framer_chunk(struct ashen_framer *f,
 		return size;
 
 	len = cobs_decode(f->buf, f->rx_len, f->buf, f->bufsize);
-	if (len >= 0) {
+	if (len >= 0)
 		f->on_frame(f->ctx, f->buf, len);
-	} else if (len == -EINTR) {
+	else if (len == -EINTR)
 		pr_warn("ashen-tamper: truncated frame received\n");
-	}/* else: consecutive null bytes received. ignore. */
+	/* else: consecutive null bytes received. ignore. */
 	f->rx_len = 0;
 	return null_pos + 1; /* consume the delimiter too */
 }
 
-void ashen_framer_reset(struct ashen_framer *f) {
+void ashen_framer_reset(struct ashen_framer *f)
+{
 	f->null_run = 0;
 	f->sync = false;
 	f->rx_len = 0;
@@ -55,7 +56,7 @@ size_t ashen_framer_push(struct ashen_framer *f, const u8 *buf, size_t size)
 			buf++;
 			size--;
 			consumed++;
-			f->null_run ++;
+			f->null_run++;
 		}
 
 		if (f->null_run >= FRAMER_SYNC_NULLS) {

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Copyright (C) Yasec / Jan Sebastian Götte 2026
  * Author:       Jan Sebastian Götte <kernel@yasec.de>
@@ -65,7 +65,8 @@ struct ashen_tamper {
 	size_t log_buf_pos;
 
 	/* Hexdump of the wire, flushed a line at a time: on 16 bytes, on a
-	 * direction change, or 100 ms after the last byte. */
+	 * direction change, or 100 ms after the last byte.
+	 */
 #define ASHEN_TRACE_LINE 16
 	spinlock_t trace_lock;
 	struct hrtimer trace_timer;

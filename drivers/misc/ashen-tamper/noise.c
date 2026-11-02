@@ -44,7 +44,8 @@ void noise_init(struct noise_state *st, bool i_am_the_initiator)
 
 bool noise_keypair_generate(struct noise_keypair *kp)
 {
-	BUG_ON(kp->has_key);
+	if (WARN_ON_ONCE(kp->has_key))
+		return false;
 
 	if (!curve25519_generate_secret(kp->private))
 		return false;
@@ -104,7 +105,8 @@ static void hkdf2(u8 output1[static NOISE_HASH_LEN], u8 output2[static NOISE_HAS
 	memzero_explicit(output, sizeof(output));
 }
 
-static void __maybe_unused hkdf3(u8 output1[static NOISE_HASH_LEN], u8 output2[static NOISE_HASH_LEN],
+static void __maybe_unused hkdf3(u8 output1[static NOISE_HASH_LEN],
+		u8 output2[static NOISE_HASH_LEN],
 		u8 output3[static NOISE_HASH_LEN],
 		const u8 *input, size_t input_len,
 		const u8 chaining_key[static NOISE_HASH_LEN])
@@ -138,8 +140,8 @@ static bool __must_check mix_key_dh(struct noise_handshake_state *st,
 {
 	u8 dh_out[NOISE_PUBLIC_KEY_LEN];
 
-	BUG_ON(!local->has_key);
-	BUG_ON(!remote->has_key);
+	if (WARN_ON_ONCE(!local->has_key || !remote->has_key))
+		return false;
 
 	if (unlikely(!curve25519(dh_out, local->private, remote->public))) {
 		memzero_explicit(dh_out, sizeof(dh_out));
@@ -184,7 +186,8 @@ ssize_t noise_handshake_write_msg_a(struct noise_handshake_state *st,
 	memcpy(out, st->loc_ephem.public, NOISE_PUBLIC_KEY_LEN);
 	mix_hash(st, out, NOISE_PUBLIC_KEY_LEN);
 	/* We still need to advance the hash ratchet even if we have no data to
-	 * mix in */
+	 * mix in
+	 */
 	mix_hash(st, NULL, 0);
 	return NOISE_PUBLIC_KEY_LEN;
 }
@@ -203,8 +206,8 @@ bool noise_handshake_read_msg_a(struct noise_handshake_state *st,
 ssize_t noise_handshake_write_msg_b(struct noise_handshake_state *st,
 		u8 out[static 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN])
 {
-	BUG_ON(!st->rem_ephem.has_key);
-	BUG_ON(!st->loc_static.has_key);
+	if (WARN_ON_ONCE(!st->rem_ephem.has_key || !st->loc_static.has_key))
+		return -EINVAL;
 
 	if (!noise_keypair_generate(&st->loc_ephem))
 		return -EIO;
@@ -264,8 +267,8 @@ bool noise_handshake_read_msg_b(struct noise_handshake_state *st,
 ssize_t noise_handshake_write_msg_c(struct noise_handshake_state *st,
 		u8 out[static NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN])
 {
-	BUG_ON(!st->loc_static.has_key);
-	BUG_ON(!st->rem_ephem.has_key);
+	if (WARN_ON_ONCE(!st->loc_static.has_key || !st->rem_ephem.has_key))
+		return -EINVAL;
 
 	/* s */
 	memcpy(out, st->loc_static.public, NOISE_PUBLIC_KEY_LEN);
@@ -322,21 +325,24 @@ static void noise_handshake_split(struct noise_state *st)
 bool noise_decrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len, u8 *out)
 {
-	BUG_ON(!st->recv.cs.has_key);
+	if (WARN_ON_ONCE(!st->recv.cs.has_key))
+		return false;
 	if (!chacha20poly1305_decrypt(out, in, in_len, NULL, 0,
 				st->recv.cs.counter, st->recv.cs.key))
 		return false;
-	st->recv.cs.counter ++;
+	st->recv.cs.counter++;
 	return true;
 }
 
-void noise_encrypt_transport_message(struct noise_state *st,
+bool noise_encrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len, u8 *out)
 {
-	BUG_ON(!st->send.cs.has_key);
+	if (WARN_ON_ONCE(!st->send.cs.has_key))
+		return false;
 	chacha20poly1305_encrypt(out, in, in_len, NULL, 0,
 			st->send.cs.counter, st->send.cs.key);
-	st->send.cs.counter ++;
+	st->send.cs.counter++;
+	return true;
 }
 
 static ssize_t noise_handshake_initiator(struct noise_state *st,
@@ -345,22 +351,22 @@ static ssize_t noise_handshake_initiator(struct noise_state *st,
 {
 	ssize_t ret;
 
-	switch(st->hs.message_count) {
-		case 0:
-			return noise_handshake_write_msg_a(&st->hs, out);
-		case 1:
-			if (in_len != 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN)
-				return -EINVAL;
-			if (!noise_handshake_read_msg_b(&st->hs, in))
-				return -EBADMSG;
-			ret = noise_handshake_write_msg_c(&st->hs, out);
-			if (ret < 0)
-				return ret;
-			noise_handshake_split(st);
-			*done = true;
-			return ret;
-		default:
+	switch (st->hs.message_count) {
+	case 0:
+		return noise_handshake_write_msg_a(&st->hs, out);
+	case 1:
+		if (in_len != 2 * NOISE_PUBLIC_KEY_LEN + 2 * NOISE_MAC_LEN)
 			return -EINVAL;
+		if (!noise_handshake_read_msg_b(&st->hs, in))
+			return -EBADMSG;
+		ret = noise_handshake_write_msg_c(&st->hs, out);
+		if (ret < 0)
+			return ret;
+		noise_handshake_split(st);
+		*done = true;
+		return ret;
+	default:
+		return -EINVAL;
 	}
 }
 
@@ -368,7 +374,7 @@ static ssize_t noise_handshake_responder(struct noise_state *st,
 	const u8 *in, size_t in_len, u8 out[static NOISE_MAX_HS_MSG_LEN],
 	bool *done)
 {
-	switch(st->hs.message_count) {
+	switch (st->hs.message_count) {
 	case 0:
 		if (in_len != NOISE_PUBLIC_KEY_LEN)
 			return -EINVAL;
@@ -406,7 +412,7 @@ ssize_t noise_handshake(struct noise_state *st, const u8 *in, size_t in_len,
 		memzero_explicit(&st->hs.rem_ephem, sizeof(st->hs.rem_ephem));
 		st->hs.message_count = 0;
 	} else {
-		st->hs.message_count ++;
+		st->hs.message_count++;
 	}
 	return ret;
 }

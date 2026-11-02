@@ -1,8 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only                                                                                                                        
-/*                                                                                                                                                              
+// SPDX-License-Identifier: GPL-2.0-only
+/*
  * Copyright (C) Yasec / Jan Sebastian Götte 2026
  * Author:       Jan Sebastian Götte <kernel@yasec.de>
- */   
+ */
 
 #include <linux/errno.h>
 #include <linux/types.h>
@@ -20,6 +20,7 @@ ssize_t cobs_encode(const u8 *input, size_t input_len, u8 *output, size_t output
 			return -1;
 
 		u8 inbyte = input[in_pos];
+
 		in_pos += 1;
 
 		if (out_pos - idx_pos >= 255) {
@@ -60,9 +61,10 @@ ssize_t cobs_decode(const u8 *input, size_t input_len, u8 *output, size_t output
 
 	while (in_pos < input_len) {
 		size_t len = input[in_pos];
+
 		in_pos += 1;
 
-		for (size_t i=0; i<len-1; i++) {
+		for (size_t i = 0; i < len - 1; i++) {
 			if (in_pos >= input_len)
 				return -EINTR;
 			if (out_pos >= output_len)
@@ -79,6 +81,6 @@ ssize_t cobs_decode(const u8 *input, size_t input_len, u8 *output, size_t output
 			out_pos += 1;
 		}
 	}
-	
+
 	return out_pos;
 }

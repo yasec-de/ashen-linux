@@ -9,6 +9,12 @@ config ASHEN_TAMPER
 	select CRYPTO_LIB_CHACHA20POLY1305
 	select CRYPTO_LIB_SHA256
 	help
-	  Enables Ashen tamper sensor heartbeat protocol support. The driver
-	  supports a configurable numer of UART heartbeat links, as well as a
-	  configurable number of GPIO tamper inputs.
+	  Driver for the Ashen tamper monitor, a microcontroller attached over
+	  a UART that watches tamper sensors. The driver keeps an encrypted
+	  Noise_XX link to the monitor and exchanges heartbeats with it. When
+	  the monitor reports tamper or stops answering while the heartbeat is
+	  armed, the driver panics the kernel so that a crash kernel can wipe
+	  memory.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called ashen-tamper.

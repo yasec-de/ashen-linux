@@ -85,7 +85,7 @@ ssize_t noise_handshake(struct noise_state *st, const u8 *in, size_t in_len,
 bool noise_decrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len,
 		u8 *out);
-void noise_encrypt_transport_message(struct noise_state *st,
+bool noise_encrypt_transport_message(struct noise_state *st,
 		const u8 *in, size_t in_len,
 		u8 *out);
 

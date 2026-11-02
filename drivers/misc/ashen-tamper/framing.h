@@ -14,7 +14,7 @@
 struct ashen_framer {
 	size_t rx_len;
 	bool sync;
-	size_t null_run; 
+	size_t null_run;
 	void (*on_frame)(void *ctx, const u8 *frame, size_t len);
 	void (*on_reset)(void *ctx);
 	void *ctx;
