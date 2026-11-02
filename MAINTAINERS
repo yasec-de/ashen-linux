@@ -4041,6 +4041,7 @@ M:	Jan Sebastian Götte <kernel@yasec.de>
 S:	Supported
 F:	Documentation/devicetree/bindings/misc/ashen,hbv1.yaml
 F:	Documentation/misc-devices/ashen-tamper.rst
+F:	arch/arm64/boot/dts/qcom/qrb2210-arduino-imola-ashen-tamper.dtso
 F:	drivers/char/tpm/tpm_ashen.c
 F:	drivers/misc/ashen-tamper/
 F:	include/linux/ashen-tamper.h
