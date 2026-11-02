@@ -253,5 +253,15 @@ config TCG_SVSM
 	  level (usually VMPL0).  To compile this driver as a module, choose M
 	  here; the module will be called tpm_svsm.
 
+config TCG_ASHEN
+	tristate "Ashen tamper peripheral fwTPM interface"
+	depends on ASHEN_TAMPER
+	depends on !TCG_TPM2_HMAC
+	help
+	  TPM 2.0 frontend for the firmware TPM running inside the ashen
+	  tamper peripheral, reached over the ashen-tamper driver's Noise
+	  link. To compile this driver as a module, choose M here; the
+	  module will be called tpm_ashen.
+
 source "drivers/char/tpm/st33zp24/Kconfig"
 endif # TCG_TPM
