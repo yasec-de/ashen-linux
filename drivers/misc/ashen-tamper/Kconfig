@@ -5,6 +5,7 @@
 
 config ASHEN_TAMPER
 	tristate "Ashen Sensor Heartbeat Protocol Support"
+	select AUXILIARY_BUS
 	select CRYPTO_LIB_CURVE25519
 	select CRYPTO_LIB_CHACHA20POLY1305
 	select CRYPTO_LIB_SHA256
