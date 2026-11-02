@@ -77,6 +77,7 @@ static void test_cobs_decode_errors(struct kunit *test)
 	{
 		/* index byte promises 5 payload bytes but only 2 follow */
 		u8 trunc[] = { 6, 1, 2 };
+
 		KUNIT_EXPECT_EQ(test,
 				cobs_decode(trunc, sizeof(trunc), out, sizeof(out)),
 				-EINTR);
@@ -201,7 +202,8 @@ static void test_transport_roundtrip(struct kunit *test)
 	}
 
 	/* Standard Noise transport increments nonces; it does not implicitly
-	 * rekey after every message. */
+	 * rekey after every message.
+	 */
 	KUNIT_EXPECT_MEMEQ(test, ini->send.cs.key, ini_send_key,
 			sizeof(ini_send_key));
 	KUNIT_EXPECT_MEMEQ(test, resp->send.cs.key, resp_send_key,
@@ -378,7 +380,8 @@ static void test_framer_overrun(struct kunit *test)
 	sync_framer(f);
 
 	/* junk with no delimiter fills the buffer past cap: overrun drops it
-	 * and knocks the framer back out of sync */
+	 * and knocks the framer back out of sync
+	 */
 	memset(junk, 0xFF, sizeof(junk));
 	ashen_framer_push(f, junk, sizeof(junk));
 	KUNIT_EXPECT_EQ(test, cap->count, 0);
@@ -409,7 +412,8 @@ static void test_framer_truncated(struct kunit *test)
 
 /* The device answers our 32-null reset with >= 8 nulls of its own. Pushing that
  * run must not deliver bogus frames, and must leave the framer aligned for the
- * device's first real frame -- even with garbage buffered from the dead session. */
+ * device's first real frame -- even with garbage buffered from the dead session.
+ */
 static void test_framer_resync_on_null_run(struct kunit *test)
 {
 	struct captured *cap = kunit_kzalloc(test, sizeof(*cap), GFP_KERNEL);
@@ -440,8 +444,9 @@ static void test_framer_resync_on_null_run(struct kunit *test)
 }
 
 /* A restart re-runs noise_init() + keygen on an already-keyed state. Getting the
- * order wrong trips BUG_ON(kp->has_key) in noise_keypair_generate() and takes the
- * kernel down, so pin the sequence the driver's restart path uses. */
+ * order wrong trips WARN_ON_ONCE(kp->has_key) in noise_keypair_generate() and
+ * fails the handshake, so pin the sequence the driver's restart path uses.
+ */
 static void test_handshake_restart_rekeys(struct kunit *test)
 {
 	struct noise_state *ini = kunit_kzalloc(test, sizeof(*ini), GFP_KERNEL);
