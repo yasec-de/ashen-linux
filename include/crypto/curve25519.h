@@ -33,11 +33,13 @@ curve25519_clamp_secret(u8 secret[at_least CURVE25519_KEY_SIZE])
 	secret[31] = (secret[31] & 127) | 64;
 }
 
-static inline void
+static inline bool
 curve25519_generate_secret(u8 secret[at_least CURVE25519_KEY_SIZE])
 {
-	get_random_bytes_wait(secret, CURVE25519_KEY_SIZE);
+	if (get_random_bytes_wait(secret, CURVE25519_KEY_SIZE))
+		return false;
 	curve25519_clamp_secret(secret);
+	return true;
 }
 
 #endif /* CURVE25519_H */
