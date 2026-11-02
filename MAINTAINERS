@@ -4042,6 +4042,7 @@ S:	Supported
 F:	Documentation/devicetree/bindings/misc/ashen,hbv1.yaml
 F:	Documentation/misc-devices/ashen-tamper.rst
 F:	drivers/misc/ashen-tamper/
+F:	include/linux/ashen-tamper.h
 
 ASIX AX88796C SPI ETHERNET ADAPTER
 M:	Łukasz Stelmach <l.stelmach@samsung.com>
