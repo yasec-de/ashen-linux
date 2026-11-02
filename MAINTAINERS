@@ -4036,6 +4036,11 @@ S:	Maintained
 F:	Documentation/hwmon/asc7621.rst
 F:	drivers/hwmon/asc7621.c
 
+ASHEN TAMPER MONITOR DRIVER
+M:	Jan Sebastian Götte <kernel@yasec.de>
+S:	Supported
+F:	Documentation/devicetree/bindings/misc/ashen,hbv1.yaml
+
 ASIX AX88796C SPI ETHERNET ADAPTER
 M:	Łukasz Stelmach <l.stelmach@samsung.com>
 S:	Maintained
