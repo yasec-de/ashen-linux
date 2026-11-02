@@ -186,6 +186,8 @@ patternProperties:
     description: Asahi Kasei Corp.
   "^asc,.*":
     description: All Sensors Corporation
+  "^ashen,.*":
+    description: Ashen tamper monitor project, Yasec
   "^asix,.*":
     description: ASIX Electronics Corporation
   "^asl-tek,.*":
