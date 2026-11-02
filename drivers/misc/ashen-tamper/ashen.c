@@ -1,0 +1,765 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) Yasec / Jan Sebastian Götte 2026
+ * Author:       Jan Sebastian Götte <kernel@yasec.de>
+ */
+
+#include <linux/kernel.h>
+#include <linux/hex.h>
+#include <linux/hrtimer.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/serdev.h>
+#include <linux/sysfs.h>
+#include <linux/overflow.h>
+#include "cobs.h"
+#include "noise.h"
+#include "framing.h"
+#include "proto.h"
+#include "ashen.h"
+
+#define ASHEN_TAMPER_DEFAULT_BAUDRATE 4000000
+#define ASHEN_TAMPER_DEFAULT_TIMEOUT_US 10000
+#define ASHEN_TAMPER_DEFAULT_REFRESH_IVL_US 5000
+#define ASHEN_TAMPER_SERDEV_TIMEOUT 100 /* jiffies */
+#define ASHEN_TAMPER_RX_BUF_SIZE ASHEN_MAX_FRAME_LEN
+#define ASHEN_TAMPER_HS_TIMEOUT_US 10000000
+#define ASHEN_TAMPER_ERASE_DURATION_US 250000
+#define ASHEN_TAMPER_RESET_LEN 32
+
+
+#define ASHEN_TRACE_IDLE_MS 100
+
+static bool ash_trace_flush_locked(struct ashen_tamper *ash, unsigned long *flags)
+	__releases(&ash->trace_lock) __acquires(&ash->trace_lock)
+{
+	u8 buf[ASHEN_TRACE_LINE];
+	char line[ASHEN_TRACE_LINE * 3 + 1];
+	size_t len = ash->trace_len;
+	char dir = ash->trace_dir;
+	int off = 0;
+	size_t i;
+
+	if (!len)
+		return false;
+
+	memcpy(buf, ash->trace_buf, len);
+	ash->trace_len = 0;
+	ash->trace_dir = 0;
+
+	spin_unlock_irqrestore(&ash->trace_lock, *flags);
+	for (i = 0; i < len; i++)
+		off += scnprintf(line + off, sizeof(line) - off, "%02x ", buf[i]);
+	dev_info(&ash->serdev->dev, "  %c: %s\n", dir, line);
+	spin_lock_irqsave(&ash->trace_lock, *flags);
+	return true;
+}
+
+/* Called from IRQ context (RX) and process context (TX). */
+static void ash_trace_bytes(struct ashen_tamper *ash, char dir,
+		const u8 *buf, size_t len)
+{
+	unsigned long flags;
+	size_t i;
+
+	spin_lock_irqsave(&ash->trace_lock, flags);
+	for (i = 0; i < len; i++) {
+		if (ash->trace_len && ash->trace_dir != dir)
+			ash_trace_flush_locked(ash, &flags);
+
+		ash->trace_dir = dir;
+		ash->trace_buf[ash->trace_len++] = buf[i];
+		if (ash->trace_len == ASHEN_TRACE_LINE)
+			ash_trace_flush_locked(ash, &flags);
+	}
+	spin_unlock_irqrestore(&ash->trace_lock, flags);
+
+	/* Restart the idle timeout so a short trailing run still gets out. */
+	if (len)
+		hrtimer_start(&ash->trace_timer,
+				ms_to_ktime(ASHEN_TRACE_IDLE_MS),
+				HRTIMER_MODE_REL_SOFT);
+}
+
+static enum hrtimer_restart ash_trace_timer_fn(struct hrtimer *t)
+{
+	struct ashen_tamper *ash = container_of(t, struct ashen_tamper, trace_timer);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ash->trace_lock, flags);
+	ash_trace_flush_locked(ash, &flags);
+	spin_unlock_irqrestore(&ash->trace_lock, flags);
+	return HRTIMER_NORESTART;
+}
+
+static int ash_serdev_write(struct ashen_tamper *ash, const u8 *msg, size_t msg_len) {
+	ash_trace_bytes(ash, 'T', msg, msg_len);
+	if (msg_len == serdev_device_write(ash->serdev, msg, msg_len,
+			ASHEN_TAMPER_SERDEV_TIMEOUT)) {
+		return 0;
+	}
+	dev_err_ratelimited(&ash->serdev->dev,
+			"I/O error writing to serial\n");
+	/* Caller decides whether to restart: ashen_restart_handshake() queues
+	 * restart_work for this same failure, and a plain work_struct requeued
+	 * while running re-runs immediately. */
+	return -EIO;
+}
+
+static int ash_tx_payload(struct ashen_tamper *ash, const u8 *payload,
+		size_t len)
+{
+	ssize_t encoded;
+	size_t clen = len + NOISE_MAC_LEN;
+
+	if (clen > sizeof(ash->tx_buf))
+		return -EMSGSIZE;
+
+	noise_encrypt_transport_message(&ash->noise_st, payload, len,
+			ash->tx_buf);
+	encoded = cobs_encode(ash->tx_buf, clen, ash->tx_wire,
+			sizeof(ash->tx_wire));
+	if (encoded < 0)
+		return -EMSGSIZE;
+
+	return ash_serdev_write(ash, ash->tx_wire, encoded);
+}
+
+static int ash_tx_one(struct ashen_tamper *ash, const struct ashen_tx_req *req)
+{
+	return ash_tx_payload(ash, req->payload, req->len);
+}
+
+static void ash_tx_work_fn(struct work_struct *w)
+{
+	struct ashen_tamper *ash = container_of(w, struct ashen_tamper, tx_work);
+	struct ashen_tx_req req;
+	unsigned long flags;
+	bool ok;
+
+	for (;;) {
+		spin_lock_irqsave(&ash->tx_queue_lock, flags);
+		ok = kfifo_get(&ash->tx_queue, &req);
+		spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
+
+		if (!ok)
+			return;
+		
+		wait_for_completion_killable(&ash->connection_ready);
+		mutex_lock(&ash->tx_lock);
+		if (ash_tx_one(ash, &req)) {
+			dev_err(&ash->serdev->dev, "I/O error during payload transmission\n");
+		}
+		mutex_unlock(&ash->tx_lock);
+	}
+}
+
+/* Queue a transport message. Safe from atomic context. */
+static int ash_send_envelope(struct ashen_tamper *ash,
+		const void *msg, size_t len)
+{
+	struct ashen_tx_req req;
+	unsigned long flags;
+	bool ok;
+
+	if (len > ASHEN_TX_MAX_PAYLOAD)
+		return -EMSGSIZE;
+
+	memcpy(req.payload, msg, len);
+	req.len = len;
+
+	spin_lock_irqsave(&ash->tx_queue_lock, flags);
+	ok = kfifo_put(&ash->tx_queue, req);
+	spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
+	if (!ok)
+		return -ENOSPC;
+
+	queue_work(ash->tx_wq, &ash->tx_work);
+	return 0;
+}
+
+static void ashen_continue_handshake(struct ashen_tamper *ash,
+		const u8 *buf, size_t len)
+{
+	u8 hs_msg[NOISE_MAX_HS_MSG_LEN];
+	u8 wire[NOISE_MAX_HS_MSG_LEN + 2];
+	ssize_t to_write;
+	ssize_t encoded;
+	bool done = false;
+	u8 type;
+	hrtimer_cancel(&ash->restart_timer);
+	
+	to_write = noise_handshake(&ash->noise_st, buf, len, hs_msg, &done);
+	if (to_write < 0) {
+		dev_err_ratelimited(&ash->serdev->dev, "noise handshake error\n");
+		queue_work(ash->tx_wq, &ash->restart_work);
+		return;
+	}
+
+	mutex_lock(&ash->tx_lock);
+	if (to_write) {
+		encoded = cobs_encode(hs_msg, to_write, wire, sizeof(wire));
+		if (encoded < 0 || ash_serdev_write(ash, wire, encoded)) {
+			mutex_unlock(&ash->tx_lock);
+			queue_work(ash->tx_wq, &ash->restart_work);
+			return;
+		}
+	}
+
+	if (!done) {
+		hrtimer_start(&ash->restart_timer,
+				us_to_ktime(ASHEN_TAMPER_HS_TIMEOUT_US),
+				HRTIMER_MODE_REL_SOFT);
+		mutex_unlock(&ash->tx_lock);
+		return;
+	}
+	WRITE_ONCE(ash->conn_st, CONN_CONNECTED);
+	complete_all(&ash->connection_ready);
+
+	if (ash->autostart)
+		hrtimer_start(&ash->refresh_timer, 0, HRTIMER_MODE_REL_HARD);
+
+	type = ASHEN_MSG_STATUS_REQUEST;
+	if (ash_send_envelope(ash, &type, sizeof(type)))
+		dev_err(&ash->serdev->dev,
+				"failed to send status request\n");
+
+	dev_info(&ash->serdev->dev, "handshake completed\n");
+	mutex_unlock(&ash->tx_lock);
+}
+
+static void ashen_restart_handshake(struct work_struct *w)
+{
+	struct ashen_tamper *ash = container_of(w, struct ashen_tamper, restart_work);
+	static const u8 reset[ASHEN_TAMPER_RESET_LEN] = {0};
+	unsigned long flags;
+	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+	mutex_lock(&ash->rx_lock);
+	mutex_lock(&ash->tx_lock);
+	if (hrtimer_active(&ash->refresh_timer)) {
+		ash->autostart = true;
+		hrtimer_cancel(&ash->refresh_timer);
+	} else {
+		ash->autostart = false;
+	}
+	reinit_completion(&ash->connection_ready);
+
+	spin_lock_irqsave(&ash->tx_queue_lock, flags);
+	kfifo_reset(&ash->tx_queue);
+	spin_unlock_irqrestore(&ash->tx_queue_lock, flags);
+
+	serdev_device_write_flush(ash->serdev);
+
+	dev_info(&ash->serdev->dev, "reconnecting\n");
+	ash->have_status = false; /* stale for the new connection */
+	noise_init(&ash->noise_st, true);
+	ash->noise_st.hs.loc_static = ash->loc_static;
+	ashen_framer_reset(ash->framer);
+
+	/* on write failure fall through to the handshake timeout
+	 * rather than requeueing
+	 */
+	ash_serdev_write(ash, reset, sizeof(reset));
+
+	WRITE_ONCE(ash->conn_st, CONN_HANDSHAKE);
+	hrtimer_start(&ash->restart_timer,
+			us_to_ktime(ASHEN_TAMPER_HS_TIMEOUT_US),
+			HRTIMER_MODE_REL_SOFT);
+	mutex_unlock(&ash->tx_lock);
+	mutex_unlock(&ash->rx_lock);
+}
+
+static void ashen_handle_packet(struct ashen_tamper *ash,
+		const u8 *buf, size_t len)
+{
+	u64 delta_ns;
+	if (len < 1) {
+		dev_warn(&ash->serdev->dev, "empty message\n");
+		return;
+	}
+
+	switch (buf[0]) {
+	case ASHEN_MSG_LOG: {
+		const struct ashen_msg_log *msg = (const void *)buf;
+		char *data = msg->data;
+		size_t dlen = len - 1;
+		const char *newline;
+
+		/* print complete lines */
+		while ((newline = memchr(data, '\n', dlen))) {
+			dev_info(&ash->serdev->dev, "[dev] %.*s%.*s\n",
+					(int)ash->log_buf_pos, ash->log_buf,
+					(int)(newline - data), data);
+			ash->log_buf_pos = 0;
+			dlen -= (newline - data) + 1;
+			data = newline + 1;
+		}
+
+		/* flush as long as we're overflowing log_buf */
+		while (ash->log_buf_pos + dlen > sizeof(ash->log_buf)) {
+			size_t print_size = sizeof(ash->log_buf) - ash->log_buf_pos;
+			dev_info(&ash->serdev->dev, "[dev] %.*s%.*s\\\n",
+					(int)ash->log_buf_pos, ash->log_buf,
+					(int)print_size, data);
+			data += print_size;
+			dlen -= print_size;
+			ash->log_buf_pos = 0;
+		}
+
+		/* store partial line for next time */
+		memcpy(ash->log_buf + ash->log_buf_pos, data, dlen);
+		ash->log_buf_pos += dlen;
+		break;
+	}
+	case ASHEN_MSG_PAIR_RESPONSE: {
+		const struct ashen_msg_pair_response *msg = (const void *)buf;
+		u8 type;
+		int ret;
+
+		if (len != sizeof(*msg))
+			goto malformed;
+		if (msg->success)
+			dev_info(&ash->serdev->dev, "pairing successful\n");
+		else
+			dev_err(&ash->serdev->dev, "pairing usuccessful\n");
+
+		type = ASHEN_MSG_STATUS_REQUEST;
+		ret = ash_send_envelope(ash, &type, sizeof(type));
+		if (ret)
+			dev_warn(&ash->serdev->dev,
+					"failed to send status request: %d\n", ret);
+		break;
+	}
+	case ASHEN_MSG_STATUS_RESPONSE: {
+		const struct ashen_msg_status_response *msg = (const void *)buf;
+
+		if (len != sizeof(*msg))
+			goto malformed;
+		ash->peer_keyed = msg->is_keyed;
+		ash->peer_trusts_us = msg->peer_trusted;
+		ash->have_status = true;
+		dev_info(&ash->serdev->dev,
+				"status: peer_trusted=%d is_keyed=%d\n",
+				msg->peer_trusted, msg->is_keyed);
+		break;
+	}
+	case ASHEN_MSG_ECHO_RESPONSE: {
+		const struct ashen_msg_echo *msg = (const void *)buf;
+
+		if (len != sizeof(*msg))
+			goto malformed;
+
+		delta_ns = ktime_get_ns() - be64_to_cpu(msg->value);
+		if (delta_ns > ktime_to_ns(ash->timeout)) {
+			dev_warn(&ash->serdev->dev,
+					"received echo response stale by %llu ns\n",
+					delta_ns);
+		} else if (hrtimer_active(&ash->refresh_timer)) {
+			/* (Re)start the timer. */
+			hrtimer_start(&ash->hb_timer, ash->timeout,
+					HRTIMER_MODE_REL_HARD);
+		}
+		break;
+	}
+	case ASHEN_MSG_DISCONNECT:
+		if (len != 1)
+			goto malformed;
+		
+		dev_warn(&ash->serdev->dev, "device asked to disconnect, disarming heartbeat\n");
+		WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+			hrtimer_cancel(&ash->refresh_timer);
+		hrtimer_cancel(&ash->hb_timer);
+		reinit_completion(&ash->connection_ready);
+		break;
+	default:
+		dev_warn(&ash->serdev->dev, "unexpected message type %d\n",
+				buf[0]);
+		break;
+	}
+	return;
+
+malformed:
+	dev_warn(&ash->serdev->dev, "malformed message type %d\n", buf[0]);
+}
+
+static void ashen_framer_reset_handler(void *ctx)
+{
+	struct ashen_tamper *ash = (struct ashen_tamper *)ctx;
+	ashen_continue_handshake(ash, NULL, 0); /* start handshake */
+}
+
+static void ashen_receive_packet(void *ctx,
+		const u8 *buf, size_t len)
+{
+	struct ashen_tamper *ash = (struct ashen_tamper *)ctx;
+	u8 *frame = (u8 *)buf; /* framer buffer, in-place decrypt is fine */
+	mutex_lock(&ash->rx_lock);
+	switch (READ_ONCE(ash->conn_st)) {
+	case CONN_DISCONNECTED:
+		dev_warn(&ash->serdev->dev,
+				"received out-of-order message from device\n");
+		mutex_unlock(&ash->rx_lock);
+		break;
+	case CONN_HANDSHAKE:
+		ashen_continue_handshake(ash, buf, len);
+		mutex_unlock(&ash->rx_lock);
+		break;
+	case CONN_CONNECTED:
+		if (len < NOISE_MAC_LEN) {
+			mutex_unlock(&ash->rx_lock);
+			break;
+		}
+
+		if (!noise_decrypt_transport_message(&ash->noise_st,
+					frame, len, frame)) {
+			dev_err(&ash->serdev->dev,
+					"transport decrypt failed, restarting\n");
+			queue_work(ash->tx_wq, &ash->restart_work);
+			mutex_unlock(&ash->rx_lock);
+			break;
+		}
+		mutex_unlock(&ash->rx_lock);
+		ashen_handle_packet(ash, frame, len - NOISE_MAC_LEN);
+		break;
+	default: /* CONN_RESET_WAIT: no frames expected here, drop it */
+		mutex_unlock(&ash->rx_lock);
+		break;
+	}
+}
+
+static size_t ashen_serdev_receive(struct serdev_device *serdev,
+		const u8 *buf, size_t size)
+{
+	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
+	ash_trace_bytes(ash, 'R', buf, size);
+	return ashen_framer_push(ash->framer, buf, size);
+}
+
+static const struct serdev_device_ops ashen_serdev_ops = {
+	.receive_buf = ashen_serdev_receive,
+	.write_wakeup = serdev_device_write_wakeup,
+};
+
+static const struct of_device_id ashen_tamper_of_match[] = {
+	{
+	 .compatible = "ashen,hbv1",
+	},
+	{}
+};
+MODULE_DEVICE_TABLE(of, ashen_tamper_of_match);
+
+static enum hrtimer_restart
+ash_hb_timer_fn(struct hrtimer *t)
+{
+	panic("Timeout on ashen tamper alarm heartbeat link");
+	return HRTIMER_NORESTART; /* unreachable */
+}
+
+static enum hrtimer_restart
+ash_restart_timer_fn(struct hrtimer *t)
+{
+	struct ashen_tamper *ash = container_of(t, struct ashen_tamper, restart_timer);
+
+	if (ash->conn_st != CONN_DISCONNECTED)
+		dev_warn_ratelimited(&ash->serdev->dev,
+				"handshake timed out, retrying\n");
+	/* Get any partial line out next to the warning above. The trace timer
+	 * shares this soft base, so it cannot be running concurrently. */
+	hrtimer_try_to_cancel(&ash->trace_timer);
+	ash_trace_timer_fn(&ash->trace_timer);
+	queue_work(ash->tx_wq, &ash->restart_work);
+	return HRTIMER_NORESTART;
+}
+
+static enum hrtimer_restart
+ash_refresh_timer_fn(struct hrtimer *t)
+{
+	struct ashen_tamper *ash = container_of(t, struct ashen_tamper, refresh_timer);
+	struct ashen_msg_echo msg = {
+		.type = ASHEN_MSG_ECHO_REQUEST,
+		.value = cpu_to_be64(ktime_get_ns()),
+	};
+
+	if (ash_send_envelope(ash, &msg, sizeof(msg)))
+		dev_warn_ratelimited(&ash->serdev->dev,
+				"failed to queue echo request\n");
+
+	hrtimer_forward_now(t, ash->refresh_ivl);
+	return HRTIMER_RESTART;
+}
+
+static ssize_t timeout_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%lld\n", ktime_to_us(ash->timeout));
+}
+
+static DEVICE_ATTR_RO(timeout);
+
+static ssize_t refresh_ivl_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%lld\n", ktime_to_us(ash->refresh_ivl));
+}
+
+static DEVICE_ATTR_RO(refresh_ivl);
+
+static ssize_t armed_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%d\n", hrtimer_active(&ash->hb_timer));
+}
+
+static ssize_t armed_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	bool arm;
+	int ret = kstrtobool(buf, &arm);
+	if (ret)
+		return ret;
+
+	if (arm) {
+		if (ash->conn_st != CONN_CONNECTED)
+			return -ENOTCONN;
+		hrtimer_start(&ash->refresh_timer, 0, HRTIMER_MODE_REL_HARD);
+	} else {
+		hrtimer_cancel(&ash->refresh_timer);
+		hrtimer_cancel(&ash->hb_timer);
+	}
+	return count;
+}
+
+static DEVICE_ATTR_RW(armed);
+
+static ssize_t action_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	int ret;
+	u8 msg;
+
+	if (sysfs_streq(buf, "reconnect")) {
+		queue_work(ash->tx_wq, &ash->restart_work);
+		return count;
+	}
+
+	if (ash->conn_st != CONN_CONNECTED)
+		return -ENOTCONN;
+
+	if (sysfs_streq(buf, "erase")) {
+		msg = ASHEN_MSG_ERASE;
+		ret = ash_send_envelope(ash, &msg, sizeof(msg));
+		ash->conn_st = CONN_DISCONNECTED;
+			if (!ret)
+			hrtimer_start(&ash->restart_timer,
+					us_to_ktime(ASHEN_TAMPER_ERASE_DURATION_US),
+					HRTIMER_MODE_REL_SOFT);
+	} else if (sysfs_streq(buf, "pair")) {
+		msg = ASHEN_MSG_PAIR_REQUEST;
+		ret = ash_send_envelope(ash, &msg, sizeof(msg));
+	} else {
+		return -EINVAL;
+	}
+
+	return ret ? ret : count;
+}
+
+static DEVICE_ATTR_WO(action);
+
+static ssize_t status_show(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	struct noise_keypair *loc = &ash->noise_st.hs.loc_static;
+	int len;
+
+	len = sysfs_emit(buf, "connected %d\n",
+			ash->conn_st == CONN_CONNECTED);
+	mutex_lock(&ash->rx_lock);
+	if (loc->has_key)
+		len += sysfs_emit_at(buf, len, "local_pubkey %*phN\n",
+				NOISE_PUBLIC_KEY_LEN, loc->public);
+	mutex_unlock(&ash->rx_lock);
+	if (ash->have_status) {
+		len += sysfs_emit_at(buf, len, "peer_keyed %d\n",
+				ash->peer_keyed);
+		len += sysfs_emit_at(buf, len, "peer_trusts_us %d\n",
+				ash->peer_trusts_us);
+	}
+	return len;
+}
+
+static DEVICE_ATTR_RO(status);
+
+static ssize_t local_privkey_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	struct noise_keypair kp = {};
+
+	if (hex2bin(kp.private, buf, NOISE_PRIVATE_KEY_LEN))
+		return -EINVAL;
+	if (!curve25519_generate_public(kp.public, kp.private))
+		return -EINVAL;
+	kp.has_key = true;
+
+	ash->loc_static = kp;
+	queue_work(ash->tx_wq, &ash->restart_work);
+	return count;
+}
+
+static DEVICE_ATTR_WO(local_privkey);
+
+static ssize_t remote_pubkey_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct ashen_tamper *ash = dev_get_drvdata(dev);
+	struct noise_pubkey *rem = &ash->noise_st.hs.rem_static;
+	if (!rem->has_key)
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%*phN\n", NOISE_PUBLIC_KEY_LEN, rem->public);
+}
+
+static DEVICE_ATTR_RO(remote_pubkey);
+
+static struct attribute *ashen_attrs[] = {
+	&dev_attr_timeout.attr,
+	&dev_attr_refresh_ivl.attr,
+	&dev_attr_armed.attr,
+	&dev_attr_status.attr,
+	&dev_attr_action.attr,
+	&dev_attr_local_privkey.attr,
+	&dev_attr_remote_pubkey.attr,
+	NULL,
+};
+
+ATTRIBUTE_GROUPS(ashen);
+
+static int ashen_tamper_probe(struct serdev_device *serdev)
+{
+	int ret;
+	u32 baudrate = ASHEN_TAMPER_DEFAULT_BAUDRATE;
+	u32 val;
+
+	struct ashen_tamper *ash = devm_kzalloc(&serdev->dev,
+			sizeof(*ash), GFP_KERNEL);
+
+	if (!ash) {
+		ret = -ENOMEM;
+		goto error;
+	}
+
+	ash->serdev = serdev;
+	serdev_device_set_drvdata(serdev, ash);
+	serdev_device_set_client_ops(serdev, &ashen_serdev_ops);
+
+	ash->framer = devm_kzalloc(&serdev->dev,
+			struct_size(ash->framer, buf, ASHEN_TAMPER_RX_BUF_SIZE),
+			GFP_KERNEL);
+	if (!ash->framer) {
+		ret = -ENOMEM;
+		goto error;
+	}
+	ash->framer->bufsize = ASHEN_TAMPER_RX_BUF_SIZE;
+	ash->framer->on_frame = ashen_receive_packet;
+	ash->framer->on_reset = ashen_framer_reset_handler;
+	ash->framer->ctx = ash;
+	ashen_framer_reset(ash->framer);
+
+	of_property_read_u32(serdev->dev.of_node, "baudrate", &baudrate);
+
+	ash->autostart = !of_property_read_bool(serdev->dev.of_node, "no-autostart");
+
+	val = ASHEN_TAMPER_DEFAULT_TIMEOUT_US;
+	of_property_read_u32(serdev->dev.of_node, "timeout-us", &val);
+	ash->timeout = us_to_ktime(val);
+
+	val = ASHEN_TAMPER_DEFAULT_REFRESH_IVL_US;
+	of_property_read_u32(serdev->dev.of_node, "refresh-ivl-us", &val);
+	ash->refresh_ivl = us_to_ktime(val);
+
+	if (!noise_keypair_generate(&ash->loc_static)) {
+		dev_err(&serdev->dev, "unable to generate static keypair\n");
+		ret = -EIO;
+		goto error;
+	}
+
+	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+	init_completion(&ash->connection_ready);
+	mutex_init(&ash->tx_lock);
+	mutex_init(&ash->rx_lock);
+
+	spin_lock_init(&ash->tx_queue_lock);
+	spin_lock_init(&ash->trace_lock);
+	INIT_KFIFO(ash->tx_queue);
+	INIT_WORK(&ash->tx_work, ash_tx_work_fn);
+	INIT_WORK(&ash->restart_work, ashen_restart_handshake);
+	ash->tx_wq = alloc_ordered_workqueue("ashen-tamper-tx", WQ_MEM_RECLAIM);
+	if (!ash->tx_wq) {
+		ret = -ENOMEM;
+		goto error;
+	}
+
+	hrtimer_setup(&ash->hb_timer, ash_hb_timer_fn, CLOCK_MONOTONIC,
+			HRTIMER_MODE_REL_HARD);
+	hrtimer_setup(&ash->refresh_timer, ash_refresh_timer_fn, CLOCK_MONOTONIC,
+			HRTIMER_MODE_REL_HARD);
+	hrtimer_setup(&ash->restart_timer, ash_restart_timer_fn, CLOCK_MONOTONIC,
+			HRTIMER_MODE_REL_SOFT);
+	hrtimer_setup(&ash->trace_timer, ash_trace_timer_fn, CLOCK_MONOTONIC,
+			HRTIMER_MODE_REL_SOFT);
+
+	ret = serdev_device_open(serdev);
+	if (ret) {
+		dev_err(&serdev->dev, "Unable to open ashen heartbeat link\n");
+		goto error_wq;
+	}
+
+	baudrate = serdev_device_set_baudrate(serdev, baudrate);
+	dev_info(&serdev->dev, "Using baudrate: %u\n", baudrate);
+	serdev_device_set_flow_control(serdev, false);
+	queue_work(ash->tx_wq, &ash->restart_work);
+	return 0;
+
+error_wq:
+	destroy_workqueue(ash->tx_wq);
+error:
+	return ret;
+}
+
+static void ashen_tamper_remove(struct serdev_device *serdev)
+{
+	struct ashen_tamper *ash = serdev_device_get_drvdata(serdev);
+	WRITE_ONCE(ash->conn_st, CONN_DISCONNECTED);
+
+	hrtimer_cancel(&ash->restart_timer);
+	hrtimer_cancel(&ash->refresh_timer);
+	hrtimer_cancel(&ash->hb_timer);
+	hrtimer_cancel(&ash->trace_timer);
+	cancel_work_sync(&ash->restart_work);
+	cancel_work_sync(&ash->tx_work);
+	serdev_device_close(serdev);
+	destroy_workqueue(ash->tx_wq);
+}
+
+static struct serdev_device_driver ashen_tamper_driver = {
+	.probe = ashen_tamper_probe,
+	.remove = ashen_tamper_remove,
+	.driver = {
+		.name = "ashen-tamper",
+		.of_match_table = ashen_tamper_of_match,
+		.dev_groups = ashen_groups,
+	},
+};
+
+module_serdev_device_driver(ashen_tamper_driver);
+
+MODULE_DESCRIPTION("Ashen tamper sensor heartbeat protocol driver");
+MODULE_AUTHOR("Yasec");
+MODULE_AUTHOR("Jan Sebastian Götte <kernel@yasec.de>");
+MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0");
