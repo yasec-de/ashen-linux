@@ -4040,6 +4040,7 @@ ASHEN TAMPER MONITOR DRIVER
 M:	Jan Sebastian Götte <kernel@yasec.de>
 S:	Supported
 F:	Documentation/devicetree/bindings/misc/ashen,hbv1.yaml
+F:	Documentation/misc-devices/ashen-tamper.rst
 F:	drivers/misc/ashen-tamper/
 
 ASIX AX88796C SPI ETHERNET ADAPTER
